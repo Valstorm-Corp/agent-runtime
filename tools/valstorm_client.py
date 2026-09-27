@@ -416,10 +416,35 @@ class ValstormApiClient:
             return True
         return False
 
+    async def _attempt_refresh(self, context: str):
+        """Internal helper to execute the token refresh logic."""
+        log_auth_debug(f"Executing {context} token refresh inside lock.")
+        refreshed = await refresh_valstorm_tokens_async(
+            base_url=self.base_url,
+            refresh_token=self.refresh_token,
+            auth_file_path=self.auth_file_path,
+        )
+        if refreshed:
+            self.token = refreshed[0]
+            self.refresh_token = refreshed[1]
+        else:
+            raise ConnectionRefusedError(f"Failed to refresh Valstorm token during {context}. Refresh token invalid.")
+
     async def _request_with_retry(self, method: str, endpoint: str, **kwargs) -> httpx.Response:
         """Sends HTTP request and automatically retries with refreshed token on 401."""
         self._ensure_authenticated()
         clean_endpoint = endpoint.lstrip("/")
+
+        # 1. Proactive Token Refresh Check (before sending the request)
+        if self.refresh_token and is_jwt_expired(self.token, margin_seconds=60):
+            log_auth_debug("Proactive refresh triggered. Token expires in <60s.")
+            async with self._lock:
+                # Re-check inside lock in case another request already refreshed it
+                # If still expired/near-expired, refresh it.
+                if is_jwt_expired(self.token, margin_seconds=60):
+                    await self._try_refresh_token()
+        
+        # 2. Execute Request
         resp = await self._client.request(method, clean_endpoint, **kwargs)
 
         if resp.status_code == 401:

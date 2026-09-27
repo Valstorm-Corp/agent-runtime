@@ -3,20 +3,32 @@
 import base64
 from typing import Any, Dict, List, Optional, Tuple
 import json
-from anthropic import AnthropicVertex # ADDED
 
 from core.models import Message, ToolCall, UsageMetadata, collapse_repeating_text
 from core.retry import execute_with_retry
 from providers.base import BaseProvider, extract_and_resolve_images
 
 
+# Friendly aliases -> GEAP (Vertex) Claude model ids. Current GEAP ids use dashes and no
+# date pin (e.g. "claude-opus-5-5"); older ones carry "@YYYYMMDD" (e.g. "claude-sonnet-4-5@20250929").
+# See https://platform.claude.com/docs/en/build-with-claude/claude-on-vertex-ai
 CLAUDE_GEAP_NAME_MAP: Dict[str, str] = {
-    "claude-opus-5.5": "claude-3-5-opus",
-    "claude-3-opus": "claude-3-opus-20240229",
-    "claude-3-sonnet": "claude-3-sonnet-20240229",
-    "claude-3-5-sonnet": "claude-3-5-sonnet-20240620",
-    "claude-3-haiku": "claude-3-haiku-20240307",
+    "claude-opus-4-5": "claude-opus-4-5@20251101",
+    "claude-sonnet-4-5": "claude-sonnet-4-5@20250929",
+    "claude-haiku-4-5": "claude-haiku-4-5@20251001",
 }
+
+
+def normalize_geap_claude_model(model: str) -> str:
+    """'claude-opus-5.5' / 'anthropic/claude-opus-5.5' -> 'claude-opus-5-5' (keeps '@date' pins)."""
+    m = model.strip()
+    if m.lower().startswith("anthropic/"):
+        m = m.split("/", 1)[1]
+    base, sep, pin = m.partition("@")
+    base = base.lower().replace(".", "-").replace("_", "-")
+    if sep:
+        return f"{base}@{pin}"
+    return CLAUDE_GEAP_NAME_MAP.get(base, base)
 
 
 class AnthropicProvider(BaseProvider):
@@ -49,10 +61,10 @@ class AnthropicProvider(BaseProvider):
             return self._client
         
         if self.use_vertex_ai:
-            # Note: AnthropicVertex was imported at the top of the file
+            from anthropic import AsyncAnthropicVertex  # lazy: needs the anthropic[vertex] extra (google-auth)
             if not self.region or not self.project_id:
                 raise ValueError("AnthropicVertex client requires region and project_id for GEAP.")
-            self._client = AnthropicVertex(region=self.region, project_id=self.project_id)
+            self._client = AsyncAnthropicVertex(region=self.region, project_id=self.project_id)
         else:
             import anthropic
             self._client = anthropic.AsyncAnthropic(api_key=self.api_key)
@@ -169,19 +181,12 @@ class AnthropicProvider(BaseProvider):
 
         target_model = model or self.default_model or "claude-haiku-4.5"
 
-        if self.use_vertex_ai and not target_model.startswith("projects/"):
-            # The client seems to be overriding partially qualified paths.
-            # Fully qualify the model path for GEAP/AnthropicVertex
-            if not self.region or not self.project_id:
-                raise ValueError("AnthropicProvider misconfiguration: GEAP is enabled but region or project_id is missing.")
-            
-            canonical_name = CLAUDE_GEAP_NAME_MAP.get(target_model.lower(), target_model)
-            
-            # The location is typically 'global' for GEAP LLMs.
-            target_model = (
-                f"projects/{self.project_id}/locations/{self.region}/"
-                f"publishers/anthropic/models/{canonical_name}"
-            )
+        if self.use_vertex_ai:
+            # AnthropicVertex builds .../publishers/anthropic/models/{model}:rawPredict itself,
+            # so it needs the bare GEAP model id, never a fully-qualified resource path.
+            if target_model.startswith("projects/"):
+                target_model = target_model.rsplit("/models/", 1)[-1]
+            target_model = normalize_geap_claude_model(target_model)
         client = self._get_client()
 
         system_prompt, formatted_msgs = self._format_messages(messages)

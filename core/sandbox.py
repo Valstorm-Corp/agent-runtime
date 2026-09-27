@@ -19,6 +19,12 @@ from typing import Any, Dict, List, Optional
 
 MAX_OUTPUT_BYTES = 16 * 1024  # 16 KB output truncation budget
 
+# Marker appended to every shell command so the sandbox can learn the directory the
+# command finished in. This makes `cd` persist across terminal_exec calls (like a real
+# shell session) instead of silently resetting, which previously caused the agent to
+# believe it was in one directory while file tools edited another.
+_CWD_MARKER = "__VSAGENT_CWD__"
+
 
 def _truncate_output(text: str, max_bytes: int = MAX_OUTPUT_BYTES) -> str:
     """Truncates oversized output preserving beginning and end."""
@@ -102,12 +108,22 @@ class BaseSandbox(ABC):
         """Performs precise find-and-replace text replacement in a file."""
         pass
 
+    def resolve_path(self, path: Optional[str]) -> Path:
+        """Resolves a (possibly relative) path against the sandbox's current working directory."""
+        cwd = getattr(self, "cwd", None)
+        p = Path(path or ".").expanduser()
+        if not p.is_absolute() and cwd is not None:
+            p = Path(cwd) / p
+        return p.resolve()
+
 
 class HostSandbox(BaseSandbox):
     """Local host execution environment for Valstorm Desktop and local developer mode."""
 
     def __init__(self, base_dir: Optional[str] = None):
         self.base_dir = Path(base_dir).expanduser().resolve() if base_dir else Path.cwd().resolve()
+        # Session working directory: starts at base_dir and follows `cd` in terminal_exec.
+        self.cwd = self.base_dir
         self._is_active = True
 
     async def start(self) -> None:
@@ -124,13 +140,19 @@ class HostSandbox(BaseSandbox):
         timeout_sec: int = 120,
         workdir: Optional[str] = None,
     ) -> str:
-        cwd = Path(workdir).expanduser().resolve() if workdir else self.base_dir
+        cwd = self.resolve_path(workdir) if workdir else Path(self.cwd)
         if not cwd.is_dir():
             return f"Error: Working directory does not exist: {cwd}"
 
+        # Append a trailer that reports the final working directory while preserving the exit code.
+        wrapped = (
+            f"{command}\n"
+            f"__vs_rc=$?; printf '\\n{_CWD_MARKER}%s\\n' \"$(pwd)\"; exit $__vs_rc"
+        )
+
         try:
             proc = await asyncio.create_subprocess_shell(
-                command,
+                wrapped,
                 cwd=str(cwd),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -155,6 +177,18 @@ class HostSandbox(BaseSandbox):
             stderr_str = stderr_bytes.decode("utf-8", errors="replace")
             exit_code = proc.returncode or 0
 
+            # Extract and strip the cwd trailer; persist `cd` into the session.
+            cwd_note = ""
+            marker_idx = stdout_str.rfind(_CWD_MARKER)
+            if marker_idx != -1:
+                final_cwd_str = stdout_str[marker_idx + len(_CWD_MARKER):].strip().splitlines()[0:1]
+                stdout_str = stdout_str[:marker_idx].rstrip("\n")
+                if final_cwd_str:
+                    final_cwd = Path(final_cwd_str[0])
+                    if final_cwd.is_dir() and final_cwd.resolve() != cwd.resolve():
+                        self.cwd = final_cwd.resolve()
+                        cwd_note = f"\n[Working directory is now {self.cwd} — later terminal_exec and file tool calls with relative paths resolve from here]"
+
             output_parts = []
             if stdout_str:
                 output_parts.append(stdout_str)
@@ -165,9 +199,10 @@ class HostSandbox(BaseSandbox):
             truncated = _truncate_output(combined_output)
 
             if exit_code == 0:
-                return truncated if truncated else "(Command finished with exit code 0 and no output)"
+                body = truncated if truncated else "(Command finished with exit code 0 and no output)"
+                return body + cwd_note
             else:
-                return f"Command exited with code {exit_code}\n\n{truncated}"
+                return f"Command exited with code {exit_code}\n\n{truncated}{cwd_note}"
         except Exception as e:
             return f"Error executing command: {type(e).__name__}: {e}"
 
@@ -186,7 +221,7 @@ class HostSandbox(BaseSandbox):
         offset: int = 1,
         limit: int = 2000,
     ) -> str:
-        target = Path(path).expanduser().resolve()
+        target = self.resolve_path(path)
         if not target.is_file():
             return f"Error: File not found: {target}"
 
@@ -206,7 +241,7 @@ class HostSandbox(BaseSandbox):
             f"{idx + 1:5d}| {line}" for idx, line in enumerate(selected_lines, start=start_idx)
         ]
 
-        header = f"[{target.name} (Lines {start_idx + 1}-{end_idx} of {total_lines})]"
+        header = f"[{target} (Lines {start_idx + 1}-{end_idx} of {total_lines})]"
         output = header + "\n" + "\n".join(numbered_lines)
 
         if end_idx < total_lines:
@@ -219,7 +254,7 @@ class HostSandbox(BaseSandbox):
         path: str,
         content: str,
     ) -> str:
-        file_path = Path(path).expanduser().resolve()
+        file_path = self.resolve_path(path)
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             temp_file = file_path.with_suffix(".tmp_write")
@@ -239,7 +274,7 @@ class HostSandbox(BaseSandbox):
         new_string: str,
         replace_all: bool = False,
     ) -> str:
-        file_path = Path(path).expanduser().resolve()
+        file_path = self.resolve_path(path)
         if not file_path.is_file():
             return f"Error: File not found: {file_path}"
 
@@ -257,7 +292,7 @@ class HostSandbox(BaseSandbox):
                 temp_file = file_path.with_suffix(".tmp_patch")
                 temp_file.write_text(new_content, encoding="utf-8")
                 temp_file.replace(file_path)
-                return f"Successfully patched {file_path.name}:\n\n```diff\n{diff_text}```"
+                return f"Successfully patched {file_path}:\n\n```diff\n{diff_text}```"
         except Exception:
             pass
 
@@ -297,7 +332,7 @@ class HostSandbox(BaseSandbox):
             )
         )
         diff_text = "".join(diff_lines)
-        return f"Successfully patched {file_path.name} ({count if not replace_all else count} occurrence{'s' if count != 1 else ''} replaced):\n\n```diff\n{diff_text}```"
+        return f"Successfully patched {file_path} ({count if not replace_all else count} occurrence{'s' if count != 1 else ''} replaced):\n\n```diff\n{diff_text}```"
 
 
 # ContextVar for async task / request sandbox propagation
@@ -306,12 +341,28 @@ _current_sandbox: contextvars.ContextVar[Optional[BaseSandbox]] = contextvars.Co
 )
 
 
+_default_host_sandbox: Optional[HostSandbox] = None
+
+
 def get_current_sandbox() -> BaseSandbox:
-    """Gets the currently active execution sandbox in async context, defaulting to HostSandbox."""
+    """Gets the currently active execution sandbox in async context.
+
+    Falls back to a process-wide HostSandbox singleton so session state (the working
+    directory that follows `cd`) persists across tool calls instead of being recreated
+    on every call.
+    """
+    global _default_host_sandbox
     sb = _current_sandbox.get()
     if sb is None:
-        sb = HostSandbox()
+        if _default_host_sandbox is None:
+            _default_host_sandbox = HostSandbox()
+        sb = _default_host_sandbox
     return sb
+
+
+def resolve_agent_path(path: Optional[str]) -> Path:
+    """Resolves a tool-supplied path against the active sandbox's working directory."""
+    return get_current_sandbox().resolve_path(path)
 
 
 def set_current_sandbox(sandbox: Optional[BaseSandbox]) -> contextvars.Token:

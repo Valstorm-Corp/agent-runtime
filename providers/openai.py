@@ -10,6 +10,20 @@ from core.retry import execute_stream_with_retry, execute_with_retry
 from providers.base import BaseProvider, extract_and_resolve_images
 
 
+def _normalize_finish_reason(raw: Any) -> Optional[str]:
+    """Maps OpenAI-style finish reasons to the runtime's normalized vocabulary."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    r = raw.lower()
+    if r in ("length", "max_tokens"):
+        return "length"
+    if r == "content_filter":
+        return "safety"
+    if "malformed" in r:
+        return "malformed_tool_call"
+    return r
+
+
 class OpenAIProvider(BaseProvider):
     """Provider adapter for OpenAI models via official openai SDK."""
 
@@ -183,14 +197,20 @@ class OpenAIProvider(BaseProvider):
                 if not isinstance(output_content, str):
                     output_content = json.dumps(output_content)
 
-                # Check if preceding message had matching tool_call_id
-                prev_msg = formatted[-1] if formatted else None
+                # Check the most recent assistant message (skipping sibling tool results from the same
+                # parallel batch) for a matching tool_call_id. Previously only formatted[-1] was checked,
+                # so results 2..N of a parallel batch were downgraded to plain user text.
                 valid_preceding_call = False
-                if prev_msg and prev_msg.get("role") == "assistant":
-                    for tc in prev_msg.get("tool_calls", []):
-                        if tc.get("id") == tool_call_id:
-                            valid_preceding_call = True
-                            break
+                for prev_msg in reversed(formatted):
+                    prev_role = prev_msg.get("role")
+                    if prev_role == "tool":
+                        continue
+                    if prev_role == "assistant":
+                        for tc in prev_msg.get("tool_calls", []) or []:
+                            if tc.get("id") == tool_call_id:
+                                valid_preceding_call = True
+                                break
+                    break
 
                 if valid_preceding_call:
                     formatted.append({
@@ -205,6 +225,16 @@ class OpenAIProvider(BaseProvider):
                     })
 
         return formatted
+
+    def _apply_valstorm_headers(self, req_kwargs: Dict[str, Any]) -> None:
+        """Tags Valstorm gateway calls with the chat id so metered charges map back to the ai_chat."""
+        if self.provider_name != "valstorm":
+            return
+        chat_id = (getattr(self, "_request_context", None) or {}).get("chat_id")
+        if chat_id:
+            headers = dict(req_kwargs.get("extra_headers") or {})
+            headers["X-Valstorm-Chat-Id"] = str(chat_id)
+            req_kwargs["extra_headers"] = headers
 
     def _parse_response(
         self, response: Any, model_name: str
@@ -228,9 +258,11 @@ class OpenAIProvider(BaseProvider):
         tool_calls: List[ToolCall] = []
         content: Optional[str] = None
 
+        finish_reason: Optional[str] = None
         if hasattr(response, "choices") and len(response.choices) > 0:
             choice_msg = response.choices[0].message
             content = getattr(choice_msg, "content", None)
+            finish_reason = _normalize_finish_reason(getattr(response.choices[0], "finish_reason", None))
 
             raw_tool_calls = getattr(choice_msg, "tool_calls", None)
             if raw_tool_calls:
@@ -272,6 +304,7 @@ class OpenAIProvider(BaseProvider):
             provider=self.provider_name,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
+            finish_reason=finish_reason,
         )
         return msg, usage
 
@@ -296,6 +329,7 @@ class OpenAIProvider(BaseProvider):
 
         if formatted_tools:
             req_kwargs["tools"] = formatted_tools
+        self._apply_valstorm_headers(req_kwargs)
 
         for k, v in kwargs.items():
             if k not in ("max_retries", "initial_delay", "backoff_factor", "max_delay", "jitter"):
@@ -352,6 +386,7 @@ class OpenAIProvider(BaseProvider):
         }
         if formatted_tools:
             req_kwargs["tools"] = formatted_tools
+        self._apply_valstorm_headers(req_kwargs)
 
         for k, v in kwargs.items():
             if k not in ("max_retries", "initial_delay", "backoff_factor", "max_delay", "jitter"):
@@ -389,6 +424,7 @@ class OpenAIProvider(BaseProvider):
             accumulated_content: List[str] = []
             tool_calls_builder: Dict[int, Dict[str, Any]] = {}
             usage = UsageMetadata()
+            stream_finish_reason: Optional[str] = None
 
             async for chunk in stream:
                 raw_usage = getattr(chunk, "usage", None)
@@ -396,9 +432,22 @@ class OpenAIProvider(BaseProvider):
                     usage.prompt_tokens = getattr(raw_usage, "prompt_tokens", 0) or usage.prompt_tokens
                     usage.completion_tokens = getattr(raw_usage, "completion_tokens", 0) or usage.completion_tokens
                     usage.total_tokens = getattr(raw_usage, "total_tokens", 0) or usage.total_tokens
+                    tokens_details = getattr(raw_usage, "prompt_tokens_details", None)
+                    if tokens_details is not None:
+                        cached = (
+                            tokens_details.get("cached_tokens")
+                            if isinstance(tokens_details, dict)
+                            else getattr(tokens_details, "cached_tokens", None)
+                        )
+                        if cached is not None:
+                            usage.cached_tokens = cached
 
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
+
+                chunk_finish = getattr(chunk.choices[0], "finish_reason", None)
+                if chunk_finish:
+                    stream_finish_reason = _normalize_finish_reason(chunk_finish)
 
                 delta = chunk.choices[0].delta
                 if not delta:
@@ -436,16 +485,9 @@ class OpenAIProvider(BaseProvider):
                             elif isinstance(func, dict) and func.get("thought_signature"):
                                 tool_calls_builder[idx]["thought_signature"] = func["thought_signature"]
 
-            if not accumulated_content and not tool_calls_builder:
-                # If stream produced no content or tool calls, fallback to standard generate
-                res_msg, res_usage = await self.generate(messages=messages, tools=tools, model=model, **kwargs)
-                if res_msg.content:
-                    yield StreamEvent(event_type=StreamEventType.TEXT_CHUNK, delta=res_msg.content)
-                if res_msg.tool_calls:
-                    for tc in res_msg.tool_calls:
-                        yield StreamEvent(event_type=StreamEventType.TOOL_CALL_DETECTED, tool_call=tc)
-                yield StreamEvent(event_type=StreamEventType.TURN_COMPLETE, message=res_msg, usage=res_usage)
-                return
+            # NOTE: an empty stream used to trigger a silent second, non-streaming request (double
+            # billing, and it hid the real finish reason). Now the empty message is returned with its
+            # finish_reason so the ReAct engine can react (continue / retry / nudge) explicitly.
 
             final_tool_calls: List[ToolCall] = []
             for idx in sorted(tool_calls_builder.keys()):
@@ -473,6 +515,7 @@ class OpenAIProvider(BaseProvider):
                 provider=self.provider_name,
                 tool_calls=final_tool_calls if final_tool_calls else None,
                 usage=usage,
+                finish_reason=stream_finish_reason,
             )
             yield StreamEvent(
                 event_type=StreamEventType.TURN_COMPLETE,

@@ -47,6 +47,8 @@ class UsageMetadata(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     cached_tokens: Optional[int] = None
+    # Reasoning ("thinking") tokens reported by the provider, when available.
+    thoughts_tokens: Optional[int] = None
 
     @property
     def input_tokens(self) -> int:
@@ -99,6 +101,11 @@ class Message(BaseModel):
     tool_calls: Optional[List[ToolCall]] = None
     tool_result: Optional[ToolResult] = None
     usage: Optional[UsageMetadata] = None
+    # Why generation stopped, normalized: "stop", "tool_calls", "length", "malformed_tool_call",
+    # "safety", or the provider's raw value. None when the provider didn't report one.
+    finish_reason: Optional[str] = None
+    # Concrete model version that actually served the request (e.g. resolved from a "-latest" alias).
+    model_version: Optional[str] = None
     created_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     modified_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -118,6 +125,9 @@ class StreamEventType(str, Enum):
     TOOL_EXECUTION_START = "tool_execution_start"
     TOOL_EXECUTION_RESULT = "tool_execution_result"
     TURN_COMPLETE = "turn_complete"
+    # Emitted after each individual LLM call inside a turn. TURN_COMPLETE is reserved for
+    # the end of the whole ReAct turn so clients don't mistake a mid-turn call for the end.
+    LLM_CALL_COMPLETE = "llm_call_complete"
     ERROR = "error"
     CONTEXT_COMPACTED = "context_compacted"
     ITERATION_LIMIT_REACHED = "iteration_limit_reached"
@@ -145,6 +155,8 @@ class SessionState(BaseModel):
     active_provider: str = "valstorm"
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Cache-hit subset of prompt tokens (monotonic; not reset by context compaction)
+    total_cached_input_tokens: int = 0
     tasks: List[Dict[str, Any]] = Field(default_factory=list)
     _total_tokens_accum: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -179,6 +191,7 @@ class SessionState(BaseModel):
         if msg.usage is not None:
             self.total_input_tokens += msg.usage.prompt_tokens
             self.total_output_tokens += msg.usage.completion_tokens
+            self.total_cached_input_tokens += int(msg.usage.cached_tokens or 0)
         self.modified_at = datetime.now(timezone.utc)
 
 

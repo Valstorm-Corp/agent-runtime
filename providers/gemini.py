@@ -1,6 +1,7 @@
 """Gemini provider adapter implementing BaseProvider."""
 
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
+import re
 import uuid
 
 from core.models import Message, StreamEvent, StreamEventType, ToolCall, UsageMetadata, collapse_repeating_text
@@ -8,27 +9,103 @@ from core.retry import execute_stream_with_retry, execute_with_retry
 from providers.base import BaseProvider, extract_and_resolve_images
 
 
+def _normalize_gemini_finish(raw: Any) -> Optional[str]:
+    """Maps Gemini FinishReason enums/strings to the runtime's normalized vocabulary."""
+    if raw is None:
+        return None
+    name = getattr(raw, "name", None)
+    if not isinstance(name, str):
+        name = raw if isinstance(raw, str) else None
+    if not name:
+        return None
+    name = name.upper().split(".")[-1]
+    if name in ("STOP", "FINISH_REASON_UNSPECIFIED"):
+        return "stop"
+    if name == "MAX_TOKENS":
+        return "length"
+    if "MALFORMED" in name or name in ("UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS"):
+        return "malformed_tool_call"
+    if name in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"):
+        return "safety"
+    return name.lower()
+
+
+_GEMINI_RE = re.compile(r"^(google/)?gemini-[a-z0-9.\-]+$", re.IGNORECASE)
+
+def is_gemini_model(model_name: Optional[str]) -> bool:
+    """True if the model name belongs to the Gemini family."""
+    if not model_name:
+        return False
+    return bool(_GEMINI_RE.match(model_name.lower()))
+
+def _as_str(val: Any) -> Optional[str]:
+    return val if isinstance(val, str) and val else None
+
+
+def _as_int(val: Any) -> Optional[int]:
+    return val if isinstance(val, int) and not isinstance(val, bool) else None
+
+
+def _error_status(exc: BaseException) -> Optional[int]:
+    for attr in ("code", "status_code"):
+        val = getattr(exc, attr, None)
+        if isinstance(val, int):
+            return val
+    resp = getattr(exc, "response", None)
+    val = getattr(resp, "status_code", None)
+    return val if isinstance(val, int) else None
+
+
 class GeminiProvider(BaseProvider):
-    """Provider adapter for Google Gemini models via google-genai SDK."""
+    """Provider adapter for Google Gemini models via google-genai SDK.
+
+    Backends (``backend`` arg, or VALSTORM_GEMINI_BACKEND env):
+      - "aistudio": Gemini Developer API with an API key.
+      - "vertex":   Vertex AI / Gemini Enterprise with Google credentials.
+      - "valstorm": Valstorm API Gemini pass-through (/v1/ai/gemini/...). The request is
+                    forwarded to Google in Gemini's native format, so thought signatures,
+                    text + tool-call parts, ids and streaming survive unchanged. Falls back to
+                    the OpenAI-compatible gateway automatically if the pass-through route is
+                    not deployed yet.
+      - None/"auto": legacy auto-detection (Vertex when Google credentials are present).
+    """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         default_model: str = "gemini-flash-latest",
         client: Optional[Any] = None,
+        backend: Optional[str] = None,
+        valstorm_base_url: Optional[str] = None,
+        compat_provider: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(api_key=api_key, default_model=default_model, **kwargs)
         self._client = client
+        self.backend = (backend or "").strip().lower() or None
+        self.valstorm_base_url = valstorm_base_url.rstrip("/") if valstorm_base_url else None
+        self._compat_provider = compat_provider
+        self._passthrough_unavailable = False
+        self._thinking_disabled = False
 
     @property
     def provider_name(self) -> str:
-        return "gemini"
+        return "valstorm" if self.backend == "valstorm" else "gemini"
 
     @staticmethod
     def is_enterprise_mode() -> bool:
-        """Determines whether Gemini Enterprise / Vertex AI mode is active."""
+        """Determines whether Gemini Enterprise / Vertex AI mode is active.
+
+        VALSTORM_GEMINI_BACKEND=aistudio|vertex overrides auto-detection explicitly. Without it,
+        the presence of Google credentials (including ~/.valstorm/gcp/valstorm-gemini-enterprise-sa.json)
+        selects Vertex, which silently ignores any AI Studio key.
+        """
         import os
+        explicit = os.getenv("VALSTORM_GEMINI_BACKEND", "").strip().lower()
+        if explicit in ("aistudio", "ai-studio", "developer", "api-key", "apikey"):
+            return False
+        if explicit in ("vertex", "enterprise", "geap"):
+            return True
         if os.getenv("GOOGLE_GENAI_USE_ENTERPRISE", "").lower() in ("true", "1", "yes"):
             return True
         if os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("true", "1", "yes"):
@@ -43,6 +120,107 @@ class GeminiProvider(BaseProvider):
             return True
         return False
 
+    def backend_label(self) -> str:
+        """Human-readable backend actually used for requests."""
+        if self.backend == "valstorm":
+            return "valstorm-compat" if self._passthrough_unavailable else "valstorm-passthrough"
+        if self.backend == "vertex":
+            return "vertex"
+        if self.backend == "aistudio":
+            return "aistudio"
+        return "vertex" if self.is_enterprise_mode() else "aistudio"
+
+    # ------------------------------------------------------------------ thinking
+    def _thinking_config(self) -> Optional[Any]:
+        """Explicit thinking level (VALSTORM_THINKING_LEVEL, default "medium"; "off" to omit).
+
+        Backends apply different defaults when none is sent, which is one reason agent effort
+        changed between AI Studio and Vertex. Falls back to HIGH if the SDK lacks MEDIUM, and the
+        caller disables it entirely if the model rejects the setting.
+        """
+        import os
+        from google.genai import types
+
+        if self._thinking_disabled:
+            return None
+        level = (os.getenv("VALSTORM_THINKING_LEVEL") or "medium").strip().upper()
+        if level in ("", "OFF", "NONE", "DEFAULT", "AUTO"):
+            return None
+        for candidate in (level, "HIGH"):
+            try:
+                return types.ThinkingConfig(thinking_level=candidate)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _is_thinking_error(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return ("thinking" in msg or "thinking_level" in msg or "thinkinglevel" in msg) and (
+            _error_status(exc) in (400, None) or "invalid" in msg
+        )
+
+    def _build_config(self, system_instruction: Optional[str], gemini_tools: Optional[List[Any]], kwargs: Dict[str, Any]) -> Any:
+        from google.genai import types
+
+        config_args: Dict[str, Any] = {}
+        if system_instruction:
+            config_args["system_instruction"] = system_instruction
+        if gemini_tools:
+            config_args["tools"] = gemini_tools
+        for k in ("temperature", "top_p", "top_k", "max_output_tokens"):
+            if k in kwargs:
+                config_args[k] = kwargs[k]
+        thinking = self._thinking_config()
+        if thinking is not None:
+            config_args["thinking_config"] = thinking
+        if self.backend == "valstorm":
+            chat_id = (getattr(self, "_request_context", None) or {}).get("chat_id")
+            if chat_id:
+                token = self.api_key or ""
+                auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
+                config_args["http_options"] = types.HttpOptions(
+                    headers={"Authorization": auth_header, "X-Valstorm-Chat-Id": str(chat_id)}
+                )
+        return types.GenerateContentConfig(**config_args) if config_args else None
+
+    # ------------------------------------------------------------------ valstorm helpers
+    def _get_compat_provider(self) -> Any:
+        if self._compat_provider is None:
+            from providers.openai import OpenAIProvider
+
+            base = self.valstorm_base_url or "https://api.valstorm.com/v1/ai/gemini"
+            compat_base = base[: -len("/gemini")] if base.endswith("/gemini") else base
+            self._compat_provider = OpenAIProvider(
+                api_key=self.api_key,
+                default_model=self.default_model,
+                base_url=compat_base,
+                provider_name="valstorm",
+            )
+        ctx = getattr(self, "_request_context", None) or {}
+        if ctx and hasattr(self._compat_provider, "set_request_context"):
+            self._compat_provider.set_request_context(**ctx)
+        return self._compat_provider
+
+    async def _refresh_valstorm_token(self) -> bool:
+        try:
+            from tools.valstorm_client import resolve_valstorm_auth_context, refresh_valstorm_tokens_async
+
+            _, base_url, refresh_token, auth_file = resolve_valstorm_auth_context()
+            if not refresh_token:
+                return False
+            tokens = await refresh_valstorm_tokens_async(base_url, refresh_token, auth_file_path=auth_file)
+            if tokens:
+                self.api_key = tokens[0]
+                self._client = None
+                if self._compat_provider is not None:
+                    self._compat_provider.api_key = tokens[0]
+                    self._compat_provider._client = None
+                return True
+        except Exception:
+            pass
+        return False
+
     def _get_client(self) -> Any:
         """Get or initialize the Google GenAI async client."""
         if self._client is not None:
@@ -50,7 +228,21 @@ class GeminiProvider(BaseProvider):
         import os
         from google import genai
 
-        if self.is_enterprise_mode():
+        if self.backend == "valstorm":
+            from google.genai import types
+
+            base = self.valstorm_base_url or "https://api.valstorm.com/v1/ai/gemini"
+            token = self.api_key or ""
+            auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
+            self._client = genai.Client(
+                api_key="valstorm-managed",
+                http_options=types.HttpOptions(base_url=base, headers={"Authorization": auth_header}),
+            )
+            return self._client
+
+        use_vertex = self.backend == "vertex" or (self.backend != "aistudio" and self.is_enterprise_mode())
+
+        if use_vertex:
             creds = None
             gac_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
             if gac_json:
@@ -164,7 +356,10 @@ class GeminiProvider(BaseProvider):
                     if cleaned_content:
                         parts.append(types.Part(text=cleaned_content))
                 if msg.tool_calls:
-                    is_foreign_provider = bool(msg.provider and str(msg.provider).lower() not in ("gemini", "google"))
+                    is_foreign_provider = bool(
+                        (msg.provider and str(msg.provider).lower() not in ("gemini", "google", "valstorm"))
+                        or (msg.model and not str(msg.model).lower().startswith(("gemini", "google/")))
+                    )
                     for tc in msg.tool_calls:
                         sig = getattr(tc, "thought_signature", None)
                         if sig is not None:
@@ -389,13 +584,21 @@ class GeminiProvider(BaseProvider):
         if content:
             content = collapse_repeating_text(content)
 
+        finish_reason = None
+        if candidates and len(candidates) > 0:
+            finish_reason = _normalize_gemini_finish(getattr(candidates[0], "finish_reason", None))
+        if raw_usage is not None:
+            usage.thoughts_tokens = _as_int(getattr(raw_usage, "thoughts_token_count", None))
+
         msg = Message(
             role="assistant",
             content=content,
             model=model_name,
-            provider="gemini",
+            provider=self.provider_name,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
+            finish_reason=finish_reason,
+            model_version=_as_str(getattr(response, "model_version", None)),
         )
         return msg, usage
 
@@ -407,25 +610,21 @@ class GeminiProvider(BaseProvider):
         **kwargs: Any,
     ) -> AsyncIterator[Union[StreamEvent, Tuple[Message, UsageMetadata]]]:
         """Stream response chunks from Gemini, yielding StreamEvents and final (Message, UsageMetadata) with retry."""
-        from google.genai import types
-
         model_name = model or self.default_model or "gemini-flash-latest"
-        client = self._get_client()
+
+        # Intelligent routing for Valstorm Gateway backend (GEAP/Partner models)
+        if self.backend == "valstorm" and not is_gemini_model(model_name):
+            async for item in self._get_compat_provider().generate_stream(messages=messages, tools=tools, model=model_name, **kwargs):
+                yield item
+            return
+
+        if self.backend == "valstorm" and self._passthrough_unavailable:
+            async for item in self._get_compat_provider().generate_stream(messages=messages, tools=tools, model=model_name, **kwargs):
+                yield item
+            return
 
         system_instruction, contents = self._format_messages(messages)
         gemini_tools = self._format_tools(tools)
-
-        config_args: Dict[str, Any] = {}
-        if system_instruction:
-            config_args["system_instruction"] = system_instruction
-        if gemini_tools:
-            config_args["tools"] = gemini_tools
-
-        for k in ("temperature", "top_p", "top_k", "max_output_tokens"):
-            if k in kwargs:
-                config_args[k] = kwargs[k]
-
-        config = types.GenerateContentConfig(**config_args) if config_args else None
 
         max_retries = kwargs.get("max_retries", self.max_retries)
         initial_delay = kwargs.get("initial_delay", self.initial_delay)
@@ -433,26 +632,66 @@ class GeminiProvider(BaseProvider):
         max_delay = kwargs.get("max_delay", self.max_delay)
         jitter = kwargs.get("jitter", True)
 
+        async def _open_stream():
+            """Opens the stream, handling thinking-config rejection, token refresh and missing pass-through."""
+            attempts = 0
+            while True:
+                attempts += 1
+                client = self._get_client()
+                config = self._build_config(system_instruction, gemini_tools, kwargs)
+                try:
+                    return await client.aio.models.generate_content_stream(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                except Exception as exc:
+                    status = _error_status(exc)
+                    if attempts > 3:
+                        raise
+                    if not self._thinking_disabled and self._is_thinking_error(exc):
+                        import logging
+                        logging.getLogger(__name__).warning("Model rejected thinking_config; retrying without it: %s", exc)
+                        self._thinking_disabled = True
+                        continue
+                    if self.backend == "valstorm" and status == 401 and await self._refresh_valstorm_token():
+                        continue
+                    if self.backend == "valstorm" and status in (404, 405):
+                        # Pass-through route not deployed on this API yet: use the OpenAI-compatible gateway.
+                        self._passthrough_unavailable = True
+                        return None
+                    raise
+
         async def _stream_call():
-            stream = await client.aio.models.generate_content_stream(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
+            stream = await _open_stream()
+            if stream is None:
+                async for item in self._get_compat_provider().generate_stream(messages=messages, tools=tools, model=model_name, **kwargs):
+                    yield item
+                return
 
             all_text_parts: List[str] = []
             collected_tool_calls: List[ToolCall] = []
             last_usage_metadata = None
+            finish_reason: Optional[str] = None
+            model_version: Optional[str] = None
 
             async for chunk in stream:
                 if chunk.usage_metadata:
                     last_usage_metadata = chunk.usage_metadata
+                if _as_str(getattr(chunk, "model_version", None)):
+                    model_version = chunk.model_version
 
                 candidates = getattr(chunk, "candidates", None)
                 if candidates and len(candidates) > 0:
+                    fr = getattr(candidates[0], "finish_reason", None)
+                    if fr is not None:
+                        finish_reason = _normalize_gemini_finish(fr)
                     content_obj = getattr(candidates[0], "content", None)
                     if content_obj and getattr(content_obj, "parts", None):
                         for part in content_obj.parts:
+                            if getattr(part, "thought", None):
+                                # Thought summaries (only if include_thoughts is on) are not answer text.
+                                continue
                             p_text = getattr(part, "text", None)
                             if p_text:
                                 all_text_parts.append(p_text)
@@ -477,7 +716,6 @@ class GeminiProvider(BaseProvider):
                     all_text_parts.append(chunk.text)
                     yield StreamEvent(event_type=StreamEventType.TEXT_CHUNK, delta=chunk.text)
 
-            # Build usage metadata
             usage = UsageMetadata()
             if last_usage_metadata is not None:
                 usage.prompt_tokens = getattr(last_usage_metadata, "prompt_token_count", 0) or 0
@@ -486,6 +724,7 @@ class GeminiProvider(BaseProvider):
                     usage.prompt_tokens + usage.completion_tokens
                 )
                 usage.cached_tokens = getattr(last_usage_metadata, "cached_content_token_count", None)
+                usage.thoughts_tokens = _as_int(getattr(last_usage_metadata, "thoughts_token_count", None))
 
             final_content = "".join(all_text_parts).strip() if all_text_parts else None
             if final_content:
@@ -494,9 +733,11 @@ class GeminiProvider(BaseProvider):
                 role="assistant",
                 content=final_content,
                 model=model_name,
-                provider="gemini",
+                provider=self.provider_name,
                 tool_calls=collected_tool_calls if collected_tool_calls else None,
                 usage=usage,
+                finish_reason=finish_reason,
+                model_version=model_version,
             )
 
             yield (msg, usage)
@@ -520,25 +761,17 @@ class GeminiProvider(BaseProvider):
         **kwargs: Any,
     ) -> Tuple[Message, UsageMetadata]:
         """Generate response non-streaming from Gemini with exponential backoff retry."""
-        from google.genai import types
-
         model_name = model or self.default_model or "gemini-flash-latest"
-        client = self._get_client()
+
+        # Intelligent routing for Valstorm Gateway backend (GEAP/Partner models)
+        if self.backend == "valstorm" and not is_gemini_model(model_name):
+            return await self._get_compat_provider().generate(messages=messages, tools=tools, model=model_name, **kwargs)
+
+        if self.backend == "valstorm" and self._passthrough_unavailable:
+            return await self._get_compat_provider().generate(messages=messages, tools=tools, model=model_name, **kwargs)
 
         system_instruction, contents = self._format_messages(messages)
         gemini_tools = self._format_tools(tools)
-
-        config_args: Dict[str, Any] = {}
-        if system_instruction:
-            config_args["system_instruction"] = system_instruction
-        if gemini_tools:
-            config_args["tools"] = gemini_tools
-
-        for k in ("temperature", "top_p", "top_k", "max_output_tokens"):
-            if k in kwargs:
-                config_args[k] = kwargs[k]
-
-        config = types.GenerateContentConfig(**config_args) if config_args else None
 
         max_retries = kwargs.get("max_retries", self.max_retries)
         initial_delay = kwargs.get("initial_delay", self.initial_delay)
@@ -547,12 +780,31 @@ class GeminiProvider(BaseProvider):
         jitter = kwargs.get("jitter", True)
 
         async def _call():
-            response = await client.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-            return self._parse_response(response, model_name)
+            attempts = 0
+            while True:
+                attempts += 1
+                client = self._get_client()
+                config = self._build_config(system_instruction, gemini_tools, kwargs)
+                try:
+                    response = await client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                    return self._parse_response(response, model_name)
+                except Exception as exc:
+                    status = _error_status(exc)
+                    if attempts > 3:
+                        raise
+                    if not self._thinking_disabled and self._is_thinking_error(exc):
+                        self._thinking_disabled = True
+                        continue
+                    if self.backend == "valstorm" and status == 401 and await self._refresh_valstorm_token():
+                        continue
+                    if self.backend == "valstorm" and status in (404, 405):
+                        self._passthrough_unavailable = True
+                        return await self._get_compat_provider().generate(messages=messages, tools=tools, model=model_name, **kwargs)
+                    raise
 
         return await execute_with_retry(
             _call,

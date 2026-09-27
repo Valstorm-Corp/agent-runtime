@@ -20,8 +20,31 @@ def test_valstorm_provider_resolution(monkeypatch):
 
     assert p_name == "valstorm"
     assert model == "gemini-flash-latest"
+    # Gemini models use the native Gemini pass-through on the Valstorm API...
+    from providers.gemini import GeminiProvider
+    assert isinstance(provider, GeminiProvider)
+    assert provider.backend == "valstorm"
+    assert provider.valstorm_base_url == "http://test-server/v1/ai/gemini"
+    assert provider.api_key == "test_tok_123"
+    # ...with the OpenAI-compatible gateway kept as an automatic fallback.
+    assert provider._compat_provider.base_url == "http://test-server/v1/ai"
+    assert provider._compat_provider.api_key == "test_tok_123"
+
+
+def test_valstorm_provider_resolution_passthrough_disabled(monkeypatch):
+    monkeypatch.setenv("VALSTORM_AI_BASE_URL", "http://test-server/v1/ai")
+    monkeypatch.setenv("VALSTORM_GEMINI_PASSTHROUGH", "0")
+    provider, model, p_name = resolve_provider_instance("valstorm", api_key="test_tok_123")
+    assert p_name == "valstorm"
     assert provider.base_url == "http://test-server/v1/ai"
     assert provider.api_key == "test_tok_123"
+
+
+def test_valstorm_provider_non_gemini_model_uses_openai_gateway(monkeypatch):
+    monkeypatch.setenv("VALSTORM_AI_BASE_URL", "http://test-server/v1/ai")
+    provider, model, _ = resolve_provider_instance("valstorm", api_key="tok", model="claude-opus-5-5")
+    assert model == "claude-opus-5-5"
+    assert provider.base_url == "http://test-server/v1/ai"
 
 
 def test_valstorm_key_auto_resolution(monkeypatch):

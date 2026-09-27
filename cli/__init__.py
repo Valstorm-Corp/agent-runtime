@@ -6,6 +6,7 @@ from core.storage import SessionStore
 from .helpers import (
     build_tool_registry,
     compress_session_context,
+    describe_backend,
     ensure_provider_key,
     get_provider,
     run_single_prompt,
@@ -24,6 +25,7 @@ __all__ = [
     "build_tool_registry",
     "get_provider",
     "ensure_provider_key",
+    "describe_backend",
     "PromptSession",
     "SessionStore",
 ]

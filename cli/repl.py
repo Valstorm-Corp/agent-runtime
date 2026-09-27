@@ -88,7 +88,7 @@ async def run_interactive_repl(
 
     profile_label = f" | Profile: {profile_cfg.get('name', current_profile_slug)}" if profile_cfg else ""
     print("\n=== Valstorm AI Agent Interactive REPL ===")
-    print(f"Session ID: {session.session_id[:8]}{profile_label} | Active Model: {current_model} | Provider: {current_provider_name}")
+    print(f"Session ID: {session.session_id[:8]}{profile_label} | Active Model: {current_model} | Provider: {current_provider_name} → {cli.describe_backend(provider)}")
     print(f"Loaded Tools: {', '.join(tools.list_tools())}")
     print("Commands:")
     print("  /profile [slug]                 - Switch agent profile or list available profiles")

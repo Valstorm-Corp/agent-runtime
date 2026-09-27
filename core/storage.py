@@ -224,10 +224,15 @@ class SessionStore:
                 )
                 input_tok = msg.usage.prompt_tokens if msg.usage else 0
                 output_tok = msg.usage.completion_tokens if msg.usage else 0
-                ts_str = (
-                    msg.timestamp.isoformat()
-                    if isinstance(msg.timestamp, datetime)
-                    else str(msg.timestamp)
+                created_ts_str = (
+                    msg.created_date.isoformat()
+                    if isinstance(msg.created_date, datetime)
+                    else str(msg.created_date)
+                )
+                modified_ts_str = (
+                    msg.modified_date.isoformat()
+                    if isinstance(msg.modified_date, datetime)
+                    else str(msg.modified_date)
                 )
 
                 if msg.id not in existing_msg_ids:
@@ -252,8 +257,8 @@ class SessionStore:
                             output_tok,
                             msg.model or session.active_model,
                             msg.provider or session.active_provider,
-                            ts_str,
-                            ts_str,
+                            created_ts_str,
+                            modified_ts_str,
                         ),
                     )
 
@@ -337,6 +342,7 @@ class SessionStore:
                 )
 
                 ts = datetime.fromisoformat(r["created_date"]) if r["created_date"] else datetime.now(timezone.utc)
+                mod_ts = datetime.fromisoformat(r["modified_date"]) if r["modified_date"] else ts
 
                 messages.append(
                     Message(
@@ -351,7 +357,8 @@ class SessionStore:
                         tool_calls=tool_calls,
                         tool_result=tool_result,
                         usage=usage,
-                        timestamp=ts,
+                        created_date=ts,
+                        modified_date=mod_ts,
                     )
                 )
 

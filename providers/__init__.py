@@ -138,9 +138,14 @@ def resolve_provider_instance(
         chain = build_fallback_chain(tier=tier, **kwargs)
         return chain, (model or chain.active_tier.model), "fallback"
 
-    if p_norm in ("gemini", "google"):
+    if p_norm in ("gemini", "google", "aistudio", "ai-studio", "vertex", "geap"):
         chosen_model = model or "gemini-flash-latest"
-        return GeminiProvider(api_key=api_key, default_model=chosen_model, **kwargs), chosen_model, "gemini"
+        backend = None
+        if p_norm in ("aistudio", "ai-studio"):
+            backend = "aistudio"
+        elif p_norm in ("vertex", "geap"):
+            backend = "vertex"
+        return GeminiProvider(api_key=api_key, default_model=chosen_model, backend=backend, **kwargs), chosen_model, "gemini"
 
     if p_norm in ("anthropic", "claude", "anthropic-geap"):
         chosen_model = model or "claude-3-7-sonnet-20250219"
@@ -182,14 +187,30 @@ def resolve_provider_instance(
         else:
             target_base_url = "https://api.valstorm.com/v1/ai"
         chosen_model = model or "gemini-flash-latest"
-        provider = OpenAIProvider(
+        compat = OpenAIProvider(
             api_key=target_token or "valstorm_managed",
             default_model=chosen_model,
             base_url=target_base_url,
             provider_name="valstorm",
             **kwargs,
         )
-        return provider, chosen_model, "valstorm"
+        # Gemini models go through the API's native Gemini pass-through (/v1/ai/gemini) so the
+        # request reaches Google in Gemini's own format (thought signatures, text + tool-call parts,
+        # ids, real streaming). Translating to OpenAI format and back was lossy and is what degraded
+        # agent persistence. Falls back to the OpenAI-compatible route automatically if the
+        # pass-through isn't deployed. Disable with VALSTORM_GEMINI_PASSTHROUGH=0.
+        passthrough_on = os.environ.get("VALSTORM_GEMINI_PASSTHROUGH", "1").strip().lower() not in ("0", "false", "no", "off")
+        if passthrough_on and chosen_model.lower().startswith(("gemini", "google/gemini")):
+            provider = GeminiProvider(
+                api_key=target_token or "valstorm_managed",
+                default_model=chosen_model,
+                backend="valstorm",
+                valstorm_base_url=f"{target_base_url.rstrip('/')}/gemini",
+                compat_provider=compat,
+                **kwargs,
+            )
+            return provider, chosen_model, "valstorm"
+        return compat, chosen_model, "valstorm"
 
     # OpenAI or OpenAI-compatible presets (including DigitalOcean Serverless)
     preset = OPENAI_COMPATIBLE_PRESETS.get(p_norm, {})

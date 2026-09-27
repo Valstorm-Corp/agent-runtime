@@ -56,7 +56,8 @@ class TestModels:
         assert msg.id is not None
         assert msg.role == "user"
         assert msg.content == "Hello world"
-        assert isinstance(msg.timestamp, datetime)
+        assert isinstance(msg.created_date, datetime)
+        assert isinstance(msg.modified_date, datetime)
         assert msg.tool_calls is None
         assert msg.usage is None
 

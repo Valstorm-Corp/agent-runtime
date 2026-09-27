@@ -118,6 +118,13 @@ class ChainedFallbackProvider(BaseProvider):
         self._tier_cooldowns: Dict[int, float] = {}
         self._current_tier_index: int = 0
 
+    def set_request_context(self, **context: Any) -> None:
+        super().set_request_context(**context)
+        for tier in self.tiers:
+            setter = getattr(tier.provider, "set_request_context", None)
+            if callable(setter):
+                setter(**context)
+
     def reset_active_tier(self) -> None:
         """Resets tier index to primary (0) and clears all failure cooldowns."""
         self._current_tier_index = 0

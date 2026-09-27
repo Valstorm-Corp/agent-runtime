@@ -218,6 +218,15 @@ class BaseProvider(ABC):
             else float(os.environ.get("VALSTORM_RETRY_MAX_DELAY", "30.0"))
         )
         self.extra_config = kwargs
+        self._request_context: Dict[str, Any] = {}
+
+    def set_request_context(self, **context: Any) -> None:
+        """Attach per-run metadata (e.g. chat_id) that providers may forward upstream.
+
+        Only the Valstorm gateway uses it today (X-Valstorm-Chat-Id, for per-chat metered billing);
+        other providers ignore it.
+        """
+        self._request_context = {k: v for k, v in context.items() if v is not None}
 
     @property
     @abstractmethod

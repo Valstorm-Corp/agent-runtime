@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import os
 import sys
 import time
@@ -30,6 +31,8 @@ from providers import (
     OpenAIProvider,
     resolve_provider_instance,
 )
+
+logger = logging.getLogger(__name__)
 
 console = Console()
 
@@ -146,6 +149,14 @@ def ensure_provider_key(provider_name: str, api_key: Optional[str] = None, inter
     if api_key and api_key.strip():
         return api_key.strip()
 
+    p_low = provider_name.strip().lower()
+    # Vertex uses Google credentials (service account / ADC), not an API key.
+    if p_low in ("vertex", "geap"):
+        return ""
+    # "aistudio" is the Gemini Developer API: same key as the "gemini" provider.
+    if p_low in ("aistudio", "ai-studio"):
+        provider_name = "gemini"
+
     # 2. For Valstorm provider, active CLI session credentials take precedence over stale static files
     if provider_name.lower() == "valstorm":
         token, _ = resolve_valstorm_credentials()
@@ -229,6 +240,7 @@ async def sync_cli_turn_to_valstorm(
     tool_calls_executed: Optional[List[Dict[str, Any]]] = None,
     turn_input_tokens: Optional[int] = None,
     turn_output_tokens: Optional[int] = None,
+    turn_cached_tokens: Optional[int] = None,
 ) -> bool:
     """Asynchronously syncs a completed CLI turn and token telemetry to Valstorm backend."""
     try:
@@ -293,6 +305,8 @@ async def sync_cli_turn_to_valstorm(
             "provider": getattr(final_message, "provider", None) or getattr(session, "active_provider", None),
             "device_pid": os.getpid(),
         }
+        if turn_cached_tokens:
+            payload["cached_input_tokens"] = int(min(turn_cached_tokens, input_toks or turn_cached_tokens))
         if tool_calls_payload:
             payload["tool_calls"] = tool_calls_payload
 
@@ -310,6 +324,55 @@ async def sync_cli_turn_to_valstorm(
             return False
     except Exception:
         return False
+
+
+def describe_backend(provider: Any) -> str:
+    """Returns the concrete backend the active provider talks to (e.g. 'vertex', 'aistudio', 'valstorm-passthrough')."""
+    try:
+        inner = getattr(getattr(provider, "active_tier", None), "provider", None) or provider
+        label_fn = getattr(inner, "backend_label", None)
+        if callable(label_fn):
+            return label_fn()
+        name = getattr(inner, "provider_name", None)
+        return f"{name} (openai-compatible)" if name == "valstorm" else str(name or "unknown")
+    except Exception:
+        return "unknown"
+
+
+def preserve_partial_turn(session: SessionState, initial_msg_count: int, reason: str) -> None:
+    """Keeps completed work from an interrupted/failed turn instead of discarding the whole turn.
+
+    Previously a single API error erased every tool call and result from the turn, so the agent
+    "forgot" work it had already done (files were still changed on disk). Now only an incomplete
+    trailing assistant tool-call message (and any partial results after it) is removed, and a short
+    assistant note records that the turn was interrupted.
+    """
+    msgs = session.messages
+    if len(msgs) <= initial_msg_count:
+        return
+    for idx in range(len(msgs) - 1, initial_msg_count - 1, -1):
+        m = msgs[idx]
+        if m.role == "assistant" and m.tool_calls:
+            call_ids = {tc.id for tc in m.tool_calls}
+            answered = {
+                t.tool_result.call_id
+                for t in msgs[idx + 1:]
+                if t.role == "tool" and t.tool_result is not None
+            }
+            if not call_ids.issubset(answered):
+                del msgs[idx:]
+            break
+        if m.role == "assistant":
+            break
+    if len(msgs) > initial_msg_count:
+        msgs.append(
+            Message(
+                role="assistant",
+                content=f"[Turn interrupted before completion: {reason}. Work completed above is preserved; resume from where it stopped.]",
+                model=getattr(session, "active_model", None),
+                provider=getattr(session, "active_provider", None),
+            )
+        )
 
 
 async def stream_and_render_turn(
@@ -330,6 +393,7 @@ async def stream_and_render_turn(
     tool_calls_executed: List[Dict[str, Any]] = []
     active_tool_calls_map: Dict[str, Dict[str, Any]] = {}
     start_prompt_tokens = session.total_prompt_tokens
+    start_cached_tokens = session.total_cached_input_tokens
     start_completion_tokens = session.total_completion_tokens
 
     async def _runner():
@@ -460,7 +524,7 @@ async def stream_and_render_turn(
                 print()
                 in_text_stream = False
             print(f"\n\033[91m✖ [API Error]\033[0m {e}")
-            session.messages = session.messages[:initial_msg_count]
+            preserve_partial_turn(session, initial_msg_count, f"API error: {str(e)[:300]}")
 
     initial_msg_count = len(session.messages)
     task = asyncio.create_task(_runner())
@@ -479,9 +543,10 @@ async def stream_and_render_turn(
             print()
             in_text_stream = False
         print(f"\n\033[91m✖ [API Error]\033[0m {e}")
-        session.messages = session.messages[:initial_msg_count]
+        preserve_partial_turn(session, initial_msg_count, f"API error: {str(e)[:300]}")
 
     if was_interrupted:
+        preserve_partial_turn(session, initial_msg_count, "interrupted by the user")
         if in_text_stream:
             print()
         print("\n\033[93m⚡ [In-progress prompt stopped. Type 'exit' or press Ctrl+C again to leave session]\033[0m")
@@ -504,6 +569,7 @@ async def stream_and_render_turn(
     if final_message and cloud_sync:
         turn_prompt_tokens = max(0, session.total_prompt_tokens - start_prompt_tokens)
         turn_comp_tokens = max(0, session.total_completion_tokens - start_completion_tokens)
+        turn_cached_tokens = max(0, session.total_cached_input_tokens - start_cached_tokens)
         try:
             await sync_cli_turn_to_valstorm(
                 session=session,
@@ -514,6 +580,7 @@ async def stream_and_render_turn(
                 tool_calls_executed=tool_calls_executed if tool_calls_executed else None,
                 turn_input_tokens=turn_prompt_tokens if turn_prompt_tokens > 0 else None,
                 turn_output_tokens=turn_comp_tokens if turn_comp_tokens > 0 else None,
+                turn_cached_tokens=turn_cached_tokens if turn_cached_tokens > 0 else None,
             )
         except Exception as sync_err:
             logger.debug(f"Cloud sync failed: {sync_err}")
@@ -581,7 +648,7 @@ async def run_single_prompt(
         session.add_message(Message(role="system", content=sys_prompt, model=active_model, provider=active_provider))
 
     prof_label = f" | Profile: {profile_cfg.get('name')} ({profile})" if profile_cfg else ""
-    console.print(f"\n[dim]--- Running Task with Model: {active_model} ({active_provider}){prof_label} ---[/dim]")
+    console.print(f"\n[dim]--- Running Task with Model: {active_model} ({active_provider} → {describe_backend(provider)}){prof_label} ---[/dim]")
     console.print(f"[bold cyan]Prompt:[/bold cyan] {prompt}\n")
 
     _, _ = await stream_and_render_turn(

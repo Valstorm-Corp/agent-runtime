@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from core.tools import ToolRegistry, tool
-from core.sandbox import get_current_sandbox
+from core.sandbox import get_current_sandbox, resolve_agent_path
 
 IGNORED_DIRECTORIES = {
     ".git",
@@ -76,7 +76,9 @@ async def terminal_exec(
     Args:
         command: The shell command to execute (e.g. 'pytest tests/', 'git status').
         timeout: Maximum seconds to allow the process to run (default: 120).
-        workdir: Directory to execute the command from (defaults to current working directory).
+        workdir: Directory to execute the command from (defaults to the session working directory).
+            A `cd` inside the command persists for later terminal_exec and file tool calls,
+            like a normal shell session.
     """
     sandbox = get_current_sandbox()
     return await sandbox.exec_command(command=command, timeout_sec=timeout, workdir=workdir)
@@ -107,7 +109,7 @@ async def patch_file(
     if "Successfully patched" in res:
         try:
             from core.lsp.diagnostics import get_file_diagnostics
-            file_path = Path(path).expanduser().resolve()
+            file_path = resolve_agent_path(path)
             diagnostics = await get_file_diagnostics(file_path)
             if diagnostics:
                 res += f"\n\n{diagnostics}"
@@ -134,7 +136,7 @@ async def write_file(path: str, content: str) -> str:
     if "Successfully wrote" in res:
         try:
             from core.lsp.diagnostics import get_file_diagnostics
-            file_path = Path(path).expanduser().resolve()
+            file_path = resolve_agent_path(path)
             diagnostics = await get_file_diagnostics(file_path)
             if diagnostics:
                 res += f"\n\n{diagnostics}"
@@ -311,7 +313,7 @@ async def search_files(
         file_glob: Optional filter for filenames when target='content' (e.g. '*.py', '*.ts').
         limit: Maximum number of matches to return (default: 50).
     """
-    return await asyncio.to_thread(_search_files_sync, pattern, target, path, file_glob, limit)
+    return await asyncio.to_thread(_search_files_sync, pattern, target, str(resolve_agent_path(path)), file_glob, limit)
 
 
 # =====================================================================
@@ -360,7 +362,7 @@ async def find_symbols(
         path: Directory to search in (defaults to current working directory).
         limit: Maximum matches to return (default: 50).
     """
-    root_dir = Path(path).expanduser().resolve()
+    root_dir = resolve_agent_path(path)
     if not root_dir.is_dir():
         return f"Error: Directory not found: {root_dir}"
 
@@ -394,7 +396,7 @@ async def package_blast_radius(path: str, root_dir: str = ".") -> str:
         path: The file path being modified (e.g. 'packages/components/Button.tsx').
         root_dir: Workspace root directory (defaults to current working directory).
     """
-    root = Path(root_dir).expanduser().resolve()
+    root = resolve_agent_path(root_dir)
     try:
         import json
         from core.native_bridge import native_get_blast_radius

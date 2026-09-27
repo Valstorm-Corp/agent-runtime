@@ -326,6 +326,29 @@ class ContextCompactor:
         while active_conversation and active_conversation[0].role == "tool":
             active_conversation.pop(0)
 
+        # The digest is delivered as conversation content (a user turn), NOT as an extra system
+        # message: some backends keep only one system instruction, so a second system message
+        # silently replaced the agent's real system prompt after compaction.
+        if consolidated_summary_msg:
+            digest_text = consolidated_summary_msg.content or ""
+            if active_conversation and active_conversation[0].role == "user":
+                first = active_conversation[0].model_copy(deep=True)
+                merged_text = f"{digest_text}\n\n{first.content or first.body or ''}".strip()
+                first.content = merged_text
+                first.body = merged_text
+                active_conversation[0] = first
+            else:
+                active_conversation.insert(
+                    0,
+                    Message(
+                        role="user",
+                        content=digest_text,
+                        model=session.active_model,
+                        provider=session.active_provider,
+                    ),
+                )
+            consolidated_summary_msg = None
+
         # If active_conversation starts on an assistant message, prepend a user context message
         # so that conversation turns always start cleanly on a user turn.
         if active_conversation and active_conversation[0].role in ("assistant", "model"):

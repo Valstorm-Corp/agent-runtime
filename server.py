@@ -405,6 +405,7 @@ async def _sync_turn_to_valstorm(
     subagents: Optional[List[Dict[str, Any]]] = None,
     error: Optional[str] = None,
     message_id: Optional[str] = None,
+    cached_input_tokens: Optional[int] = None,
 ):
     """Directly synchronizes terminal turn execution state, messages, and token telemetry to Valstorm backend.
     
@@ -438,6 +439,8 @@ async def _sync_turn_to_valstorm(
         payload["error"] = error[:4000]
     if message_id:
         payload["message_id"] = message_id
+    if cached_input_tokens:
+        payload["cached_input_tokens"] = int(min(cached_input_tokens, input_tokens or cached_input_tokens))
     if tool_calls:
         payload["tool_calls"] = tool_calls
     if subagents:
@@ -577,6 +580,7 @@ async def _execute_agent_run(
     full_output = ""
     input_tokens = 0
     output_tokens = 0
+    cached_input_tokens = 0
     tool_calls_map: Dict[str, Dict[str, Any]] = {}
     subagents_list: List[Dict[str, Any]] = []
 
@@ -710,6 +714,10 @@ async def _execute_agent_run(
             session_store=session_store,
         )
 
+        if effective_chat_id:
+            # Metered billing attributes each Valstorm gateway call to this ai_chat (X-Valstorm-Chat-Id)
+            session.metadata["valstorm_chat_id"] = effective_chat_id
+
         effective_input = payload.input
         if effective_input and effective_input.strip().startswith("/memorize"):
             raw_fact = effective_input.strip()[len("/memorize"):].strip()
@@ -786,10 +794,18 @@ async def _execute_agent_run(
                     "result": tr.output,
                 })
 
+            elif event.event_type == StreamEventType.LLM_CALL_COMPLETE:
+                # Persist progress after every model call so a crash mid-turn doesn't lose work.
+                try:
+                    session_store.save_session(session)
+                except Exception as save_err:
+                    logger.debug(f"[{run_id}] Mid-turn session save failed: {save_err}")
+
             elif event.event_type == StreamEventType.TURN_COMPLETE and event.message:
                 usage = getattr(event.message, "usage", None)
                 input_tokens = _safe_token_count(getattr(usage, "prompt_tokens", None))
                 output_tokens = _safe_token_count(getattr(usage, "completion_tokens", None))
+                cached_input_tokens = _safe_token_count(getattr(usage, "cached_tokens", None))
                 logger.info(
                     f"[{run_id}] Turn complete | tokens: {input_tokens}in / {output_tokens}out"
                 )
@@ -868,6 +884,7 @@ async def _execute_agent_run(
             tool_calls=tool_calls_list,
             subagents=subagents_list if subagents_list else None,
             message_id=last_asst_msg_id,
+            cached_input_tokens=cached_input_tokens or None,
         )
 
         # Smart Context & Memory: Asynchronously extract and reconcile persistent facts (Zero latency overhead)
