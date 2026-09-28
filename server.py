@@ -54,7 +54,7 @@ from tools.developer_tools import register_developer_tools
 from tools.memory_tool import register_memory_tools
 from tools.valstorm_client import (
     ValstormApiClient,
-    resolve_valstorm_credentials,
+    resolve_valstorm_auth_context,
     set_current_valstorm_auth,
 )
 from tools.valstorm_tools import register_valstorm_tools
@@ -356,7 +356,7 @@ def _build_server_tool_registry(
     register_tier1_tools(registry)
     register_memory_tools(registry, memory_store=memory_store, session_store=session_store)
 
-    token, base_url = resolve_valstorm_credentials(
+    token, base_url, refresh_token, auth_file_path = resolve_valstorm_auth_context(
         override_token=valstorm_token,
         override_base_url=override_base_url,
         env=valstorm_env
@@ -366,7 +366,7 @@ def _build_server_tool_registry(
             from tools.valstorm_platform_client import RemotePlatformContext
             from tools.execute_code import register_execute_code_tools
 
-            client = ValstormApiClient(token=token, base_url=base_url)
+            client = ValstormApiClient(token=token, base_url=base_url, refresh_token=refresh_token, auth_file_path=auth_file_path)
             platform = RemotePlatformContext(client=client)
             register_valstorm_tools(registry=registry, client=client)
             register_execute_code_tools(registry=registry, client=client, platform=platform)

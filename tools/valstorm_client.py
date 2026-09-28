@@ -427,8 +427,12 @@ class ValstormApiClient:
         if refreshed:
             self.token = refreshed[0]
             self.refresh_token = refreshed[1]
+            self._client.headers["Authorization"] = f"Bearer {self.token}"
         else:
-            raise ConnectionRefusedError(f"Failed to refresh Valstorm token during {context}. Refresh token invalid.")
+            self.token = "" # Invalidate the access token to ensure no further attempts
+            self.refresh_token = "" # Invalidate the refresh token
+            log_auth_debug(f"Failed to refresh Valstorm token during {context}. Refresh token invalid. Cleared tokens.")
+            return False
 
     async def _request_with_retry(self, method: str, endpoint: str, **kwargs) -> httpx.Response:
         """Sends HTTP request and automatically retries with refreshed token on 401."""
