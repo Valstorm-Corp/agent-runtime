@@ -235,6 +235,7 @@ class GeminiProvider(BaseProvider):
             token = self.api_key or ""
             auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
             self._client = genai.Client(
+                vertexai=False,
                 api_key="valstorm-managed",
                 http_options=types.HttpOptions(base_url=base, headers={"Authorization": auth_header}),
             )

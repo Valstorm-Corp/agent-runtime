@@ -48,52 +48,6 @@ async def _run(engine: ReActEngine, prompt: str, session: Optional[SessionState]
     return session, events
 
 
-# --------------------------------------------------------------------------- continuation guard
-@pytest.mark.asyncio
-async def test_continuation_guard_nudges_when_agent_hands_work_back():
-    provider = _Provider([
-        Message(role="assistant", content="I patched the file. Please run the tests and let me know the result."),
-        Message(role="assistant", content="Ran the tests myself: 19 passed."),
-    ])
-    engine = ReActEngine(provider=provider, tools=_Registry())
-    session, events = await _run(engine, "Fix the failing tests")
-    assert len(provider.seen) == 2
-    nudges = [m for m in session.messages if m.role == "user" and "System Notice" in (m.content or "")]
-    assert len(nudges) == 1
-    finals = [e for e in events if e.event_type == StreamEventType.TURN_COMPLETE]
-    assert len(finals) == 1 and finals[0].message.content.startswith("Ran the tests")
-
-
-@pytest.mark.asyncio
-async def test_continuation_guard_respects_no_exec_instruction():
-    provider = _Provider([Message(role="assistant", content="Please run `git push` yourself.")])
-    engine = ReActEngine(provider=provider, tools=_Registry())
-    _, _ = await _run(engine, "Do not run any commands, just tell me what to do")
-    assert len(provider.seen) == 1
-
-
-@pytest.mark.asyncio
-async def test_continuation_guard_ignores_plain_answers_and_toolless_agents():
-    provider = _Provider([Message(role="assistant", content="The capital of France is Paris.")])
-    engine = ReActEngine(provider=provider, tools=_Registry())
-    await _run(engine, "Capital of France?")
-    assert len(provider.seen) == 1
-
-    provider2 = _Provider([Message(role="assistant", content="Please run the tests and let me know.")])
-    engine2 = ReActEngine(provider=provider2, tools=_Registry(names=("calculator",)))
-    await _run(engine2, "Fix it")
-    assert len(provider2.seen) == 1
-
-
-@pytest.mark.asyncio
-async def test_continuation_guard_is_bounded():
-    handoff = "Please run the build and let me know the output."
-    provider = _Provider([Message(role="assistant", content=handoff) for _ in range(10)])
-    engine = ReActEngine(provider=provider, tools=_Registry())
-    await _run(engine, "Build it")
-    assert len(provider.seen) == 3  # original + at most 2 nudges
-
-
 # --------------------------------------------------------------------------- finish reasons
 @pytest.mark.asyncio
 async def test_truncated_output_asks_model_to_continue():

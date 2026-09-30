@@ -34,7 +34,7 @@ class CompactionResult:
     summary: str
 
 
-DEFAULT_MAX_WORKING_CEILING: int = 320_000
+DEFAULT_MAX_WORKING_CEILING: int = 640_000
 
 
 def estimate_tokens_for_text(text: Optional[str], chars_per_token: float = 4.0) -> int:
@@ -108,7 +108,7 @@ class ContextCompactor:
         target_ratio: float = 0.40,
         min_messages_to_compact: int = 8,
         keep_recent_messages: int = 6,
-        max_tool_chars: int = 250,
+        max_tool_chars: int = 16384,
     ):
         self.auto_threshold_ratio = float(
             os.environ.get("VALSTORM_COMPACT_RATIO")

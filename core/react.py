@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import json
 import os
-import re
 import time
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
@@ -15,33 +14,6 @@ from .compaction import ContextCompactor
 
 DEFAULT_MAX_ITERATIONS = int(os.environ.get("VALSTORM_MAX_ITERATIONS", "250"))
 
-# --- Continuation guard -------------------------------------------------------------------
-# Models (especially after backend changes) often end a turn by handing executable work back
-# to the user ("please run the tests and let me know"). When the agent has a shell tool, we
-# nudge it once to do that work itself. Disable with VALSTORM_CONTINUATION_GUARD=0.
-CONTINUATION_GUARD_ENABLED = os.environ.get("VALSTORM_CONTINUATION_GUARD", "1").strip().lower() not in ("0", "false", "no", "off")
-MAX_CONTINUATION_NUDGES = int(os.environ.get("VALSTORM_MAX_CONTINUATION_NUDGES", "2"))
-
-_HANDOFF_PATTERN = re.compile(
-    r"(?i)("
-    r"please\s+(re-?run|run|execute|test|try|verify|restart|rebuild|install|apply|check)\b"
-    r"|you\s+(can|should|will need to|need to|may need to|could)\s+(now\s+)?(re-?run|run|execute|test|verify|restart|rebuild|install)\b"
-    r"|run\s+(the\s+following|this|these)\s+commands?"
-    r"|let\s+me\s+know\s+(the|what|if\s+the|how\s+the|whether\s+the)\s+(result|output|tests?|command|build|error)"
-    r"|once\s+you(\s+have|'ve)?\s+(run|executed|applied|installed|tested|restarted|rebuilt|provided)"
-    r"|i\s+will\s+(now|next|then)\s+\w+"
-    r"|(let\s+me|i'll|i\s+will)\s+(now\s+)?(run|execute|check|verify|test|apply|patch|fix|update|read|look)\b[^.?!]*[.:]?\s*$"
-    r")"
-)
-_NO_EXEC_PATTERN = re.compile(r"(?i)(do\s*n[o']?t|dont|never)\s+(run|execute)|without\s+(running|executing)|no\s+commands|read-?only")
-
-CONTINUATION_NUDGE = (
-    "[System Notice: Your last message stopped before the work was finished — it describes a next step or asks "
-    "the user to run/verify something. You have tools (e.g. terminal_exec, read_file, patch_file) and can do this "
-    "yourself. Unless it genuinely requires something only the user can provide (credentials, a GUI/device action, "
-    "a product decision) or the user told you not to run commands, do it now and keep iterating until the task is "
-    "verified (tests/commands actually run and passing). If you truly cannot proceed, state exactly why in one line.]"
-)
 TRUNCATED_NUDGE = (
     "[System Notice: Your previous response was cut off by the output token limit. Continue exactly where you left "
     "off. If you were about to call a tool, call it now; if you were writing a large file, split it into smaller "
@@ -51,18 +23,6 @@ MALFORMED_CALL_NUDGE = (
     "[System Notice: Your previous tool call was malformed and could not be parsed. Retry the tool call with valid, "
     "complete JSON arguments. For very large content, split it across multiple smaller calls.]"
 )
-
-
-def _needs_continuation(text: str, tool_names: List[str], last_user_text: str) -> bool:
-    """True when a final answer hands executable work back to the user although the agent could do it."""
-    if not CONTINUATION_GUARD_ENABLED or not text:
-        return False
-    if not any(t in tool_names for t in ("terminal_exec", "execute_code", "patch_file", "write_file")):
-        return False
-    if last_user_text and _NO_EXEC_PATTERN.search(last_user_text):
-        return False
-    tail = text.strip()[-700:]
-    return bool(_HANDOFF_PATTERN.search(tail))
 
 
 class ReActEngine:
@@ -199,7 +159,6 @@ class ReActEngine:
         usage_meta: Optional[UsageMetadata] = None
         empty_retries = 0
         max_empty_retries = 2
-        continuation_nudges = 0
         truncation_retries = 0
         malformed_retries = 0
         turn_tool_calls = 0
@@ -374,23 +333,6 @@ class ReActEngine:
                     session.add_message(Message(role="user", content=MALFORMED_CALL_NUDGE, model=target_model, provider=assistant_msg.provider))
                     yield StreamEvent(event_type=StreamEventType.TEXT_CHUNK, delta="\n\033[93m↻ [Malformed tool call — retrying]\033[0m\n")
                     continue
-
-                # Continuation guard: the model handed executable work back to the user.
-                if has_content and continuation_nudges < MAX_CONTINUATION_NUDGES and can_continue:
-                    tool_names: List[str] = []
-                    try:
-                        tool_names = [
-                            (sc.get("function", {}) or {}).get("name") or sc.get("name", "")
-                            for sc in (schemas or [])
-                            if isinstance(sc, dict)
-                        ]
-                    except Exception:
-                        tool_names = []
-                    if _needs_continuation(assistant_msg.content or "", tool_names, user_input or ""):
-                        continuation_nudges += 1
-                        session.add_message(Message(role="user", content=CONTINUATION_NUDGE, model=target_model, provider=assistant_msg.provider))
-                        yield StreamEvent(event_type=StreamEventType.TEXT_CHUNK, delta="\n\033[96m↻ [Continuing: agent handed work back — nudging it to do it itself]\033[0m\n")
-                        continue
 
                 if not has_content:
                     if empty_retries < max_empty_retries and (iteration < iter_limit - 1):
