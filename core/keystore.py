@@ -3,7 +3,37 @@
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
+
+_PLACEHOLDER_EXACT = frozenset({
+    "changeme", "change_me", "change-me", "your_key_here", "your-key-here", "your_api_key",
+    "your-api-key", "xxx", "xxxx", "placeholder", "dummy", "test", "none", "null", "undefined", "todo",
+})
+_PLACEHOLDER_PREFIXES = ("local-", "your_", "your-", "<", "${")
+
+
+def looks_like_placeholder_key(value: Optional[str]) -> bool:
+    """True when a key value is obviously not a real credential (e.g. ``local-vsagent``, ``changeme``).
+
+    Used when resolving *backup* failover tiers so a stray placeholder exported in a shell profile
+    doesn't turn into a guaranteed 401 hop at the worst possible moment. Deliberately NOT applied to the
+    primary provider, where a dummy key can be legitimate (local OpenAI-compatible servers).
+    """
+    v = (value or "").strip().strip("'\"").lower()
+    if len(v) < 8:
+        return True
+    if v in _PLACEHOLDER_EXACT:
+        return True
+    if v.startswith(_PLACEHOLDER_PREFIXES):
+        return True
+    return "changeme" in v or "placeholder" in v or "xxxxxxxx" in v
+
+
+def mask_key(value: Optional[str]) -> str:
+    """Non-reversible display form of a key for logs/diagnostics: first 6 chars + length."""
+    if not value:
+        return "<none>"
+    return f"{value[:6]}…({len(value)} chars)"
 
 
 class KeyStore:
@@ -15,7 +45,9 @@ class KeyStore:
     1. override_key (if explicitly provided)
     2. Environment variables (e.g., GEMINI_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY)
     3. User config JSON file (~/.config/valstorm/keys.json)
-    4. Repo-level .env.ai.keys file
+    4. Repo-level .env.ai.keys / .env files. Every such file found from the working directory up to the
+       filesystem root is merged; the file NEAREST the working directory wins (an explicit env_file_path
+       wins over all of them). Use ``get_api_key_with_source`` to see which source supplied a key.
     """
 
     PROVIDER_ENV_MAP: Dict[str, List[str]] = {
@@ -126,67 +158,104 @@ class KeyStore:
             return {}
         return {}
 
-    def _read_env_keys_file(self) -> Dict[str, str]:
-        """Reads and parses .env.ai.keys, .env, and local env files in workspace."""
-        result: Dict[str, str] = {}
+    # Candidate .env-style file names relative to each directory, LOWEST -> HIGHEST precedence within one
+    # directory. agent-runtime's own files come last so they win over sibling apps' files.
+    _ENV_FILE_NAMES = (
+        ".env.ai.keys",
+        ".env",
+        "apps/api/.env",
+        "scripting/.env",
+        "scripting/admin/.env",
+        "api-scripting/.env",
+        "apps/agent-runtime/.env",
+        "apps/agent-runtime/.env.ai.keys",
+    )
+
+    def _env_file_paths(self) -> List[Path]:
+        """Existing .env-style files ordered LOWEST -> HIGHEST precedence.
+
+        Directories are walked from the filesystem root down to the working directory, so the nearest
+        directory is applied last and wins. An explicit ``env_file_path`` is applied after everything else.
+        """
         curr = Path.cwd().resolve()
-        candidate_paths = []
-        for directory in [curr, *curr.parents]:
-            for fname in [
-                ".env.ai.keys",
-                ".env",
-                "apps/agent-runtime/.env",
-                "apps/agent-runtime/.env.ai.keys",
-                "apps/api/.env",
-                "api-scripting/.env",
-            ]:
+        ordered: List[Path] = []
+        for directory in reversed([curr, *curr.parents]):
+            for fname in self._ENV_FILE_NAMES:
                 p = directory / fname
                 if p.is_file():
-                    candidate_paths.append(p)
-
+                    ordered.append(p)
         if self.env_file_path and Path(self.env_file_path).is_file():
-            candidate_paths.append(Path(self.env_file_path))
+            ordered.append(Path(self.env_file_path))
 
-        # Read in forward order and let the explicit env_file_path overwrite
-        for path in candidate_paths:
+        # De-duplicate (the same file can be reached via several relative names), keeping the LAST
+        # occurrence so a file keeps its highest-precedence position.
+        seen = set()
+        result: List[Path] = []
+        for p in reversed(ordered):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" in line:
-                            key, val = line.split("=", 1)
-                            key = key.strip()
-                            val = val.strip()
-                            if val.startswith(('"', "'")):
-                                quote_char = val[0]
-                                closing_idx = val.find(quote_char, 1)
-                                if closing_idx != -1:
-                                    val = val[1:closing_idx]
-                                else:
-                                    val = val.strip("'\"")
-                            else:
-                                if " #" in val:
-                                    val = val.split(" #", 1)[0].strip()
-                                elif "\t#" in val:
-                                    val = val.split("\t#", 1)[0].strip()
-                                val = val.strip().strip("'\"")
-                            if key and val:
-                                result[key] = val
+                rp = p.resolve()
             except Exception:
-                pass
+                rp = p
+            if rp in seen:
+                continue
+            seen.add(rp)
+            result.append(p)
+        result.reverse()
         return result
 
-    def get_api_key(
+    @staticmethod
+    def _parse_env_file(path: Path) -> Dict[str, str]:
+        """Parses one KEY=VALUE file (quotes and trailing ``# comments`` handled)."""
+        result: Dict[str, str] = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip()
+                        if val.startswith(('"', "'")):
+                            quote_char = val[0]
+                            closing_idx = val.find(quote_char, 1)
+                            if closing_idx != -1:
+                                val = val[1:closing_idx]
+                            else:
+                                val = val.strip("'\"")
+                        else:
+                            if " #" in val:
+                                val = val.split(" #", 1)[0].strip()
+                            elif "\t#" in val:
+                                val = val.split("\t#", 1)[0].strip()
+                            val = val.strip().strip("'\"")
+                        if key and val:
+                            result[key] = val
+        except Exception:
+            pass
+        return result
+
+    def _read_env_keys_file(self) -> Dict[str, str]:
+        """Merged view of all .env-style files; the nearest file to the working directory wins."""
+        merged: Dict[str, str] = {}
+        for path in self._env_file_paths():
+            merged.update(self._parse_env_file(path))
+        return merged
+
+    def get_api_key_with_source(
         self,
         provider: str,
         override_key: Optional[str] = None,
-    ) -> Optional[str]:
-        """Resolves the API key for the specified provider using the precedence hierarchy."""
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Resolves the API key and reports where it came from.
+
+        Returns ``(key, source)`` where source is ``"override"``, ``"env:NAME"``,
+        ``"<keys.json path>:NAME"`` or ``"<.env file path>:NAME"``; ``(None, None)`` if nothing is found.
+        """
         # 1. Override key
         if override_key and override_key.strip():
-            return override_key.strip()
+            return override_key.strip(), "override"
 
         candidate_keys = self._get_candidate_keys_for_provider(provider)
 
@@ -194,29 +263,37 @@ class KeyStore:
         for candidate in candidate_keys:
             val = os.environ.get(candidate)
             if val and val.strip():
-                return val.strip()
+                return val.strip(), f"env:{candidate}"
 
         # 3. Config JSON file (~/.config/valstorm/keys.json)
         json_keys = self._read_json_config()
         for candidate in candidate_keys:
             if candidate in json_keys and json_keys[candidate].strip():
-                return json_keys[candidate].strip()
+                return json_keys[candidate].strip(), f"{self.config_path}:{candidate}"
             if candidate.lower() in json_keys and json_keys[candidate.lower()].strip():
-                return json_keys[candidate.lower()].strip()
+                return json_keys[candidate.lower()].strip(), f"{self.config_path}:{candidate.lower()}"
 
-        # 4. Repo .env.ai.keys file
-        env_keys = self._read_env_keys_file()
+        # 4. .env-style files, highest precedence (nearest) first
+        layers = [(p, self._parse_env_file(p)) for p in reversed(self._env_file_paths())]
         for candidate in candidate_keys:
-            if candidate in env_keys and env_keys[candidate].strip():
-                return env_keys[candidate].strip()
-            if candidate.lower() in env_keys and env_keys[candidate.lower()].strip():
-                return env_keys[candidate.lower()].strip()
+            for path, data in layers:
+                for name in (candidate, candidate.lower()):
+                    if name in data and data[name].strip():
+                        return data[name].strip(), f"{path}:{name}"
 
         # 5. Defaults for local-only providers (ollama/vllm)
         if provider.lower() in ("ollama", "vllm"):
-            return provider.lower()
+            return provider.lower(), "default"
 
-        return None
+        return None, None
+
+    def get_api_key(
+        self,
+        provider: str,
+        override_key: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolves the API key for the specified provider using the precedence hierarchy."""
+        return self.get_api_key_with_source(provider, override_key=override_key)[0]
 
     def save_api_key(
         self,

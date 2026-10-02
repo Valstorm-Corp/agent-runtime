@@ -51,7 +51,7 @@ OPENAI_COMPATIBLE_PRESETS: Dict[str, Dict[str, Any]] = {
     },
     "do-flash": {
         "base_url": "https://inference.do-ai.run/v1",
-        "default_model": "deepseek-v4-flash",
+        "default_model": "deepseek-4-flash",
         "env_key": "DIGITALOCEAN_AI_KEY",
     },
     "do-kimi": {
@@ -61,7 +61,7 @@ OPENAI_COMPATIBLE_PRESETS: Dict[str, Dict[str, Any]] = {
     },
     "do-oss": {
         "base_url": "https://inference.do-ai.run/v1",
-        "default_model": "openai/gpt-oss-120b",
+        "default_model": "openai-gpt-oss-120b",
         "env_key": "DIGITALOCEAN_AI_KEY",
     },
     "do-llama": {

@@ -24,7 +24,8 @@ def list_sessions(
 ):
     """List recent agent conversation sessions."""
     store = SessionStore()
-    sessions = store.list_sessions(limit=limit)
+    limit_int = 20 if not isinstance(limit, int) else limit
+    sessions = store.list_sessions(limit=limit_int)
 
     if not sessions:
         console.print("[yellow]No past sessions stored.[/yellow]")

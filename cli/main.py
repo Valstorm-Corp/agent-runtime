@@ -6,6 +6,7 @@ import typer
 from rich.console import Console
 
 from .cmds.chat_cmds import chat_command, run_command
+from .cmds.doctor_cmd import doctor_command
 from .cmds.keys_cmds import keys_app
 from .cmds.memory_cmds import memory_app
 from .cmds.models_cmd import models_command
@@ -38,6 +39,7 @@ app.add_typer(server_app, name="server")
 app.command(name="chat", help="Start an interactive multi-turn AI chat REPL")(chat_command)
 app.command(name="run", help="Execute a single task prompt")(run_command)
 app.command(name="status", help="Show system status, provider keys, and active workspace")(status_command)
+app.command(name="doctor", help="Check every failover tier: key source, model IDs and a live probe")(doctor_command)
 app.command(name="version", help="Show the vsagent CLI version")(version_command)
 app.command(name="models", help="List models the Valstorm gateway accepts and what they resolve to")(models_command)
 app.command(name="update", help="Update the vsagent CLI to latest version")(update_command)

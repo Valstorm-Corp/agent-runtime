@@ -43,7 +43,7 @@ def test_resolve_digitalocean_presets():
     # 4. DO Flash shortcut
     p4, m4, _ = resolve_provider_instance("do-flash", api_key="dop_v1_test")
     assert p4.base_url == "https://inference.do-ai.run/v1"
-    assert m4 == "deepseek-v4-flash"
+    assert m4 == "deepseek-4-flash"
 
     # 5. DO Kimi shortcut
     p5, m5, _ = resolve_provider_instance("do-kimi", api_key="dop_v1_test")
@@ -53,7 +53,7 @@ def test_resolve_digitalocean_presets():
     # 6. DO OSS shortcut
     p6, m6, _ = resolve_provider_instance("do-oss", api_key="dop_v1_test")
     assert p6.base_url == "https://inference.do-ai.run/v1"
-    assert m6 == "openai/gpt-oss-120b"
+    assert m6 == "openai-gpt-oss-120b"
 
 
 def test_keystore_digitalocean_resolution(monkeypatch, tmp_path):
@@ -236,6 +236,8 @@ async def test_chained_fallback_non_retryable_error():
 
 def test_build_fallback_chain_with_primary_gemini(monkeypatch):
     """Verify specifying primary Gemini automatically builds DO failover tiers underneath."""
+    # Pin the primary to Vertex so the result does not depend on whether this machine has Google credentials.
+    monkeypatch.setenv("VALSTORM_GEMINI_BACKEND", "vertex")
     monkeypatch.setenv("GEMINI_API_KEY", "AIzaSy_fake_test_gemini")
     monkeypatch.setenv("DIGITALOCEAN_AI_KEY", "dop_v1_fake_test_do")
 
@@ -248,10 +250,13 @@ def test_build_fallback_chain_with_primary_gemini(monkeypatch):
     assert chain.tiers[0].model == "gemini-3.7-flash"
     assert "Gemini Primary" in chain.tiers[0].label
 
-    # Tier 2 and beyond must be backups (DigitalOcean), not duplicate Gemini
-    backup_providers = [t.provider_name for t in chain.tiers[1:]]
-    assert all(p != "gemini" for p in backup_providers)
-    assert any(p == "do" for p in backup_providers)
+    # Backups must not duplicate the primary's backend. The one allowed Gemini backup is the explicit AI Studio tier
+    # (separate quota from Vertex/GEAP); everything else must be a different provider.
+    backups = chain.tiers[1:]
+    gemini_backups = [t for t in backups if t.provider_name == "gemini"]
+    assert all(t.provider.backend == "aistudio" for t in gemini_backups)
+    assert len(gemini_backups) <= 1
+    assert any(t.provider_name == "do" for t in backups)
 
 
 def test_build_fallback_chain_with_primary_anthropic(monkeypatch):

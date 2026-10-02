@@ -9,10 +9,11 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import time
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
 
-from core.keystore import KeyStore
+from core.keystore import KeyStore, looks_like_placeholder_key, mask_key
 from core.models import Message, StreamEvent, StreamEventType, ToolCall, ToolResult, UsageMetadata
 from core.retry import extract_status_code, is_retryable_error
 from providers.base import BaseProvider
@@ -52,12 +53,15 @@ def is_provider_failover_candidate(exc: BaseException) -> bool:
 
     return False
 
+# NOTE: model IDs for provider "do" must match DigitalOcean's catalog (GET https://inference.do-ai.run/v1/models)
+# exactly, e.g. "openai-gpt-oss-120b" (not "openai/gpt-oss-120b"). Run `vsagent doctor` to verify them.
+
 # Default Tier 2 (Reasoner / Monorepo Dev / QA) Cascade Hierarchy
 DEFAULT_REASONER_CASCADE_SPECS = [
-    {"provider": "gemini", "model": "gemini-flash-latest", "label": "Gemini (Primary Credits)"},
-    {"provider": "do", "model": "deepseek-v4-pro", "label": "DO DeepSeek V4 Pro"},
+    {"provider": "aistudio", "model": "gemini-flash-latest", "label": "Gemini (AI Studio)"},
+    {"provider": "do", "model": "openai-gpt-oss-120b", "label": "DO GPT-oss-120b"},
     {"provider": "do", "model": "kimi-k2.6", "label": "DO Kimi K2.6"},
-    {"provider": "do", "model": "openai/gpt-oss-120b", "label": "DO GPT-oss-120b"},
+    {"provider": "do", "model": "deepseek-v4-pro", "label": "DO DeepSeek V4 Pro"},
     {"provider": "deepseek", "model": "deepseek-chat", "label": "DeepSeek Direct"},
     {"provider": "kimi", "model": "moonshot-v1-128k", "label": "Kimi Direct"},
     {"provider": "openai", "model": "gpt-4o", "label": "OpenAI Direct (Emergency)"},
@@ -66,32 +70,111 @@ DEFAULT_REASONER_CASCADE_SPECS = [
 
 # Default Tier 1 (Heavy Thinker / Architecture / RFC) Cascade Hierarchy
 DEFAULT_THINKER_CASCADE_SPECS = [
-    {"provider": "gemini", "model": "gemini-pro-latest", "label": "Gemini 3.1 Pro (Primary Credits)"},
-    {"provider": "do", "model": "claude-opus-5", "label": "DO Claude Opus 5"},
-    {"provider": "do", "model": "openai/gpt-5.6-sol", "label": "DO GPT-5.6 Sol"},
+    {"provider": "aistudio", "model": "gemini-pro-latest", "label": "Gemini 3.1 Pro (AI Studio)"},
+    {"provider": "do", "model": "anthropic-claude-opus-5", "label": "DO Claude Opus 5"},
+    {"provider": "do", "model": "openai-gpt-5.6-sol", "label": "DO GPT-5.6 Sol"},
     {"provider": "anthropic", "model": "claude-3-opus-20240229", "label": "Anthropic Direct (Emergency)"},
     {"provider": "openai", "model": "o3-mini", "label": "OpenAI Direct (Emergency)"},
 ]
 
 # Default Tier 3 (Worker Bee / Subagent / CUD / Grep) Cascade Hierarchy
 DEFAULT_WORKER_CASCADE_SPECS = [
-    {"provider": "gemini", "model": "gemini-flash-lite-latest", "label": "Gemini 3.5 Flash-Lite (Primary Credits)"},
-    {"provider": "do", "model": "deepseek-v4-flash", "label": "DO DeepSeek V4 Flash"},
-    {"provider": "do", "model": "openai/gpt-oss-120b", "label": "DO GPT-oss-120b"},
-    {"provider": "do", "model": "openai/gpt-5-nano", "label": "DO GPT-5 Nano"},
+    {"provider": "aistudio", "model": "gemini-flash-lite-latest", "label": "Gemini 3.5 Flash-Lite (AI Studio)"},
+    {"provider": "do", "model": "deepseek-4-flash", "label": "DO DeepSeek V4 Flash"},
+    {"provider": "do", "model": "openai-gpt-oss-120b", "label": "DO GPT-oss-120b"},
+    {"provider": "do", "model": "openai-gpt-5-nano", "label": "DO GPT-5 Nano"},
     {"provider": "do", "model": "llama-4-maverick", "label": "DO Llama 4 Maverick"},
     {"provider": "deepseek", "model": "deepseek-chat", "label": "DeepSeek Direct"},
 ]
 
 
+_AISTUDIO_NAMES = ("aistudio", "ai-studio")
+_GEMINI_FAMILY = ("gemini", "google", "aistudio", "ai-studio", "vertex", "geap")
+
+_PERMANENT_FAILURE_STATUS = (401, 403, 404)
+_PERMANENT_FAILURE_TYPES = ("AuthenticationError", "PermissionDeniedError", "NotFoundError")
+
+
+class InjectedFaultError(Exception):
+    """Raised when VALSTORM_FAULT_INJECT simulates a failure on a provider tier."""
+
+    def __init__(self, message: str, status_code: int = 429):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _check_injected_fault(index: int, tier: "FallbackTier") -> Optional[Tuple[int, str]]:
+    """Checks VALSTORM_FAULT_INJECT for simulation rules like 'primary:429' or 'tier1:429'."""
+    raw = os.environ.get("VALSTORM_FAULT_INJECT", "").strip()
+    if not raw:
+        return None
+    for rule in raw.split(","):
+        rule = rule.strip()
+        if not rule or ":" not in rule:
+            continue
+        target, code_str = rule.split(":", 1)
+        target = target.strip().lower()
+        try:
+            code = int(code_str.strip())
+        except ValueError:
+            code = 429
+
+        matched = False
+        if target in ("primary", "0") and index == 0:
+            matched = True
+        elif target == f"tier{index + 1}":
+            matched = True
+        elif target in (tier.provider_name.lower(), tier.model.lower()):
+            matched = True
+        elif target in tier.label.lower():
+            matched = True
+
+        if matched:
+            return code, f"rule '{rule}' matched"
+    return None
+
+
+def permanent_tier_failure_reason(exc: BaseException) -> Optional[str]:
+    """Returns a short reason when an error means *this tier cannot work until config changes*.
+
+    401/403 (bad or unauthorised key) and 404 (unknown model) do not heal on their own, so retrying the tier
+    on every turn only burns a hop. Transient errors (429/5xx/529/timeouts) return None.
+    """
+    code = extract_status_code(exc)
+    if code in _PERMANENT_FAILURE_STATUS:
+        return f"HTTP {code}"
+    name = type(exc).__name__
+    if name in _PERMANENT_FAILURE_TYPES:
+        return name
+    return None
+
+
+def _is_output_item(item: Any) -> bool:
+    """True once a stream item has put real model output (text or a tool call) in front of the consumer."""
+    if isinstance(item, StreamEvent):
+        if item.event_type == StreamEventType.TEXT_CHUNK:
+            return bool(item.delta)
+        return item.event_type == StreamEventType.TOOL_CALL_DETECTED
+    return True  # (Message, usage) tuples / bare Messages are complete results
+
+
 class FallbackTier:
     """Represents an instantiated provider and target model in the fallback chain."""
 
-    def __init__(self, provider: BaseProvider, model: str, label: str, provider_name: str):
+    def __init__(
+        self,
+        provider: BaseProvider,
+        model: str,
+        label: str,
+        provider_name: str,
+        key_source: Optional[str] = None,
+    ):
         self.provider = provider
         self.model = model
         self.label = label
         self.provider_name = provider_name
+        # Where this tier's credential came from (e.g. "env:DIGITALOCEAN_AI_KEY" or a .env path); never the key itself.
+        self.key_source = key_source
 
     def __repr__(self) -> str:
         return f"<FallbackTier label='{self.label}' provider='{self.provider_name}' model='{self.model}'>"
@@ -106,6 +189,7 @@ class ChainedFallbackProvider(BaseProvider):
         default_model: Optional[str] = None,
         on_failover_callback: Optional[Callable[[FallbackTier, FallbackTier, BaseException], None]] = None,
         cooldown_sec: float = 60.0,
+        retries_before_failover: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         if not tiers:
@@ -115,7 +199,17 @@ class ChainedFallbackProvider(BaseProvider):
         self.tiers = tiers
         self.on_failover_callback = on_failover_callback
         self.cooldown_sec = cooldown_sec
+        # Providers retry transient errors (429/5xx/529) with exponential backoff on their own (3 retries by default,
+        # which adds up to tens of seconds on an overloaded tier). While another tier is still available, a tier only
+        # gets this many retries before we move on; the last live tier keeps the provider's full retry budget.
+        # Override with VALSTORM_RETRIES_BEFORE_FAILOVER (0 = fail over immediately).
+        if retries_before_failover is None:
+            env_value = os.environ.get("VALSTORM_RETRIES_BEFORE_FAILOVER", "").strip()
+            retries_before_failover = int(env_value) if env_value.isdigit() else 1
+        self.retries_before_failover = max(0, retries_before_failover)
         self._tier_cooldowns: Dict[int, float] = {}
+        # Tiers disabled for the rest of this process (bad key / unknown model). Never includes tier 0.
+        self._dead_tiers: Dict[int, str] = {}
         self._current_tier_index: int = 0
 
     def set_request_context(self, **context: Any) -> None:
@@ -126,9 +220,10 @@ class ChainedFallbackProvider(BaseProvider):
                 setter(**context)
 
     def reset_active_tier(self) -> None:
-        """Resets tier index to primary (0) and clears all failure cooldowns."""
+        """Resets tier index to primary (0) and clears all failure cooldowns and disabled tiers."""
         self._current_tier_index = 0
         self._tier_cooldowns.clear()
+        self._dead_tiers.clear()
 
     @property
     def active_tier(self) -> FallbackTier:
@@ -164,7 +259,9 @@ class ChainedFallbackProvider(BaseProvider):
         start_index = 0
         # If no explicit model override was requested, skip tiers currently in failure cooldown
         if not model:
-            while start_index < len(self.tiers) - 1 and self._tier_cooldowns.get(start_index, 0) > now:
+            while start_index < len(self.tiers) - 1 and (
+                self._tier_cooldowns.get(start_index, 0) > now or start_index in self._dead_tiers
+            ):
                 start_index += 1
             if start_index > 0:
                 logger.info(
@@ -174,29 +271,63 @@ class ChainedFallbackProvider(BaseProvider):
 
         for index in range(start_index, len(self.tiers)):
             tier = self.tiers[index]
+            if index in self._dead_tiers:
+                collected_errors.append(
+                    f"Tier {index + 1} ({tier.label}) skipped: disabled for this session ({self._dead_tiers[index]})"
+                )
+                continue
             self._current_tier_index = index
+            emitted_output = False  # becomes True once this tier has put text/tool calls in front of the consumer
+
+            # Cap provider-level retries while there is somewhere else to go (unless the caller set it explicitly).
+            call_kwargs = dict(kwargs)
+            has_later_live_tier = any(i not in self._dead_tiers for i in range(index + 1, len(self.tiers)))
+            if has_later_live_tier and "max_retries" not in call_kwargs:
+                call_kwargs["max_retries"] = self.retries_before_failover
             target_model = model if (index == 0 and model) else tier.model
             logger.info(f"Attempting turn via Tier {index + 1}/{len(self.tiers)}: {tier.label} ({target_model})")
 
             try:
+                fault = _check_injected_fault(index, tier)
+                if fault is not None:
+                    fault_code, fault_desc = fault
+                    raise InjectedFaultError(
+                        f"Injected fault ({fault_desc}) simulating HTTP {fault_code} on {tier.label}",
+                        status_code=fault_code,
+                    )
+
                 # Check if provider supports streaming
                 if hasattr(tier.provider, "generate_stream"):
                     stream = tier.provider.generate_stream(
                         messages=messages,
                         tools=tools,
                         model=target_model,
-                        **kwargs,
+                        **call_kwargs,
                     )
                     if inspect.isawaitable(stream):
                         stream = await stream
 
                     if hasattr(stream, "__aiter__"):
                         async for item in stream:
+                            if _is_output_item(item):
+                                emitted_output = True
+                            if isinstance(item, StreamEvent) and item.event_type == StreamEventType.TURN_COMPLETE:
+                                item.metadata.setdefault("effective_tier", index + 1)
+                                item.metadata.setdefault("effective_label", tier.label)
+                                item.metadata.setdefault("effective_provider", tier.provider_name)
+                                item.metadata.setdefault("effective_model", target_model)
                             yield item
                         self._tier_cooldowns.pop(index, None)
                         return  # Success!
                     elif hasattr(stream, "__iter__"):
                         for item in stream:
+                            if _is_output_item(item):
+                                emitted_output = True
+                            if isinstance(item, StreamEvent) and item.event_type == StreamEventType.TURN_COMPLETE:
+                                item.metadata.setdefault("effective_tier", index + 1)
+                                item.metadata.setdefault("effective_label", tier.label)
+                                item.metadata.setdefault("effective_provider", tier.provider_name)
+                                item.metadata.setdefault("effective_model", target_model)
                             yield item
                         self._tier_cooldowns.pop(index, None)
                         return  # Success!
@@ -212,14 +343,14 @@ class ChainedFallbackProvider(BaseProvider):
                             messages=messages,
                             tools=tools,
                             model=target_model,
-                            **kwargs,
+                            **call_kwargs,
                         )
                     else:
                         res = tier.provider.generate(
                             messages=messages,
                             tools=tools,
                             model=target_model,
-                            **kwargs,
+                            **call_kwargs,
                         )
                         if inspect.isawaitable(res):
                             res = await res
@@ -245,6 +376,12 @@ class ChainedFallbackProvider(BaseProvider):
                             event_type=StreamEventType.TURN_COMPLETE,
                             message=final_msg,
                             usage=final_usage,
+                            metadata={
+                                "effective_tier": index + 1,
+                                "effective_label": tier.label,
+                                "effective_provider": tier.provider_name,
+                                "effective_model": target_model,
+                            },
                         )
                     else:
                         yield res
@@ -255,7 +392,6 @@ class ChainedFallbackProvider(BaseProvider):
                 raise
             except Exception as exc:
                 can_failover = is_provider_failover_candidate(exc)
-                has_next_tier = index < (len(self.tiers) - 1)
                 err_summary = f"Tier {index + 1} ({tier.label} / {target_model}) failed: {type(exc).__name__}: {str(exc)}"
                 logger.warning(err_summary)
                 collected_errors.append(err_summary)
@@ -263,9 +399,34 @@ class ChainedFallbackProvider(BaseProvider):
                 # Set cooldown for this failed tier so subsequent tool steps in this run don't retry it
                 self._tier_cooldowns[index] = time.time() + self.cooldown_sec
 
+                # Bad key / unknown model: this tier cannot work until config changes. Disable it for the rest of
+                # the process instead of retrying it every turn. Tier 0 is exempt (its auth is refreshed in-provider
+                # and re-login fixes it) and keeps using the normal cooldown.
+                dead_reason = permanent_tier_failure_reason(exc) if index > 0 else None
+                if dead_reason and index not in self._dead_tiers:
+                    self._dead_tiers[index] = dead_reason
+                    logger.warning(
+                        f"Disabling tier {index + 1} ({tier.label} / {target_model}) for this session: {dead_reason}. "
+                        f"Key source: {tier.key_source or 'unknown'}. Fix the key/model and restart (or run `vsagent doctor`)."
+                    )
+
+                if emitted_output:
+                    # Text or tool calls already reached the consumer. Cascading would replay the whole turn on another
+                    # model and duplicate that output (or re-run tool calls), so surface the error instead.
+                    logger.warning(
+                        f"Tier {index + 1} ({tier.label}) failed AFTER emitting output; not failing over to avoid duplicate output."
+                    )
+                    raise
+
+                next_index = next(
+                    (i for i in range(index + 1, len(self.tiers)) if i not in self._dead_tiers),
+                    None,
+                )
+                has_next_tier = next_index is not None
+
                 if can_failover and has_next_tier:
-                    next_tier = self.tiers[index + 1]
-                    self._current_tier_index = index + 1
+                    next_tier = self.tiers[next_index]
+                    self._current_tier_index = next_index
                     logger.info(f"Cascading from {tier.label} to {next_tier.label} due to {type(exc).__name__}: {exc}")
 
                     if self.on_failover_callback:
@@ -342,13 +503,34 @@ def infer_cascade_tier(
         return "reasoner"
 
     if model_name:
-        m = model_name.lower()
-        if any(w in m for w in ("lite", "nano", "mini", "flash-lite")):
+        # Match whole tokens, not substrings: "gemini" contains "mini", which used to push every Gemini model
+        # (including gemini-pro-*) into the worker cascade.
+        tokens = {t for t in re.split(r"[^a-z0-9]+", model_name.lower()) if t}
+        if tokens & {"lite", "nano", "mini"}:
             return "worker"
-        if any(t in m for t in ("opus", "o1", "o3-mini", "o3")) or ("pro" in m and "flash" not in m):
+        if tokens & {"opus", "o1", "o3"} or ("pro" in tokens and "flash" not in tokens):
             return "thinker"
 
     return "reasoner"
+
+
+def _resolve_key_with_source(ks: Any, provider: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolves a key and where it came from, tolerating KeyStore look-alikes without source tracking."""
+    # Resolve the key through get_api_key (the long-standing public entry point, which callers and tests patch), then ask
+    # for the source separately and only trust it when it agrees with the key we actually use.
+    key = ks.get_api_key(provider)
+    if not key:
+        return None, None
+    source: Optional[str] = None
+    getter = getattr(ks, "get_api_key_with_source", None)
+    if callable(getter):
+        try:
+            res = getter(provider)
+        except Exception:
+            res = None
+        if isinstance(res, tuple) and len(res) == 2 and res[0] == key:
+            source = res[1]
+    return key, source
 
 
 def build_fallback_chain(
@@ -392,16 +574,22 @@ def build_fallback_chain(
     explicit_key = kwargs.pop("api_key", None)
     if p_norm and p_norm not in ("fallback", "cascade", "chained"):
         primary_key = explicit_key
+        primary_source: Optional[str] = "explicit argument" if explicit_key else None
         if not primary_key and p_norm == "valstorm":
             try:
                 from tools.valstorm_client import resolve_valstorm_credentials
                 primary_key, _ = resolve_valstorm_credentials()
+                if primary_key:
+                    primary_source = "valstorm login"
             except Exception:
                 pass
         if not primary_key:
-            primary_key = ks.get_api_key(p_norm)
+            primary_key, primary_source = _resolve_key_with_source(ks, p_norm)
         if not primary_key and p_norm in ("do", "digitalocean"):
-            primary_key = ks.get_api_key("digitalocean") or ks.get_api_key("do")
+            for alias in ("digitalocean", "do"):
+                primary_key, primary_source = _resolve_key_with_source(ks, alias)
+                if primary_key:
+                    break
 
         try:
             primary_inst, resolved_model, resolved_p_name = resolve_provider_instance(
@@ -417,6 +605,7 @@ def build_fallback_chain(
                     model=resolved_model,
                     label=f"{p_norm.title()} Primary ({resolved_model})",
                     provider_name=resolved_p_name,
+                    key_source=primary_source,
                 )
             )
         except Exception as err:
@@ -431,18 +620,37 @@ def build_fallback_chain(
             # Skip if same provider family as primary (e.g. don't failover from Gemini to Gemini)
             if p_norm and spec_p == p_norm:
                 continue
+            # The AI Studio tier exists to get *off* GEAP/Vertex quota. It is redundant only when the primary is
+            # itself a Gemini provider already running on AI Studio.
+            if spec_p in _AISTUDIO_NAMES and p_norm in _GEMINI_FAMILY:
+                primary_backend = active_tiers[0].provider.backend_label() if active_tiers and hasattr(active_tiers[0].provider, "backend_label") else ""
+                if p_norm in _AISTUDIO_NAMES or primary_backend == "aistudio":
+                    continue
             if p_norm in ("do", "digitalocean") and spec_p in ("do", "digitalocean"):
                 continue
 
             target_model = spec["model"]
             label = spec.get("label", f"{spec_p}/{target_model}")
 
-            api_key = ks.get_api_key(spec_p)
+            key_provider = "gemini" if spec_p in _AISTUDIO_NAMES else spec_p
+            api_key, key_source = _resolve_key_with_source(ks, key_provider)
             if not api_key and spec_p in ("do", "digitalocean"):
-                api_key = ks.get_api_key("digitalocean") or ks.get_api_key("do")
+                for alias in ("digitalocean", "do"):
+                    api_key, key_source = _resolve_key_with_source(ks, alias)
+                    if api_key:
+                        break
 
             if not api_key:
                 logger.debug(f"Skipping tier '{label}' - no API key configured for '{spec_p}'.")
+                continue
+
+            # A placeholder (e.g. OPENAI_API_KEY=local-vsagent exported for some local tool) can only ever produce a
+            # 401 hop mid-failover. Skip the tier up front and say why.
+            if spec_p not in ("ollama", "vllm") and looks_like_placeholder_key(api_key):
+                logger.warning(
+                    f"Skipping tier '{label}': the key from {key_source or 'an unknown source'} "
+                    f"({mask_key(api_key)}) looks like a placeholder, not a real credential."
+                )
                 continue
 
             try:
@@ -458,6 +666,7 @@ def build_fallback_chain(
                         model=resolved_model,
                         label=label,
                         provider_name=resolved_p_name,
+                        key_source=key_source,
                     )
                 )
             except Exception as err:
@@ -474,6 +683,12 @@ def build_fallback_chain(
                 label="Gemini Default (Key Required)",
                 provider_name=d_p,
             )
+        )
+
+    for position, t in enumerate(active_tiers, 1):
+        logger.info(
+            f"Fallback chain tier {position}: {t.label} [{t.provider_name}/{t.model}] "
+            f"key={mask_key(getattr(t.provider, 'api_key', None))} source={t.key_source or 'n/a'}"
         )
 
     return ChainedFallbackProvider(tiers=active_tiers, default_model=active_tiers[0].model, **kwargs)

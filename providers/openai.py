@@ -177,7 +177,10 @@ class OpenAIProvider(BaseProvider):
                             },
                         }
                         sig_val = getattr(tc, "thought_signature", None)
-                        if sig_val is not None:
+                        # thought_signature is a Gemini concept. Only the Valstorm gateway understands it; strict
+                        # OpenAI-compatible endpoints (DigitalOcean, OpenAI, DeepSeek, Kimi) can reject the unknown
+                        # field with a 400, which would break a mid-conversation failover from Gemini.
+                        if sig_val is not None and self.provider_name == "valstorm":
                             if isinstance(sig_val, bytes):
                                 sig_val = base64.b64encode(sig_val).decode("ascii")
                             tc_payload["thought_signature"] = str(sig_val)
@@ -265,6 +268,15 @@ class OpenAIProvider(BaseProvider):
             finish_reason = _normalize_finish_reason(getattr(response.choices[0], "finish_reason", None))
 
             raw_tool_calls = getattr(choice_msg, "tool_calls", None)
+            if not content and not raw_tool_calls:
+                extra = getattr(choice_msg, "model_extra", None) or {}
+                reasoning = (
+                    getattr(choice_msg, "reasoning_content", None)
+                    or extra.get("reasoning_content")
+                    or extra.get("thought")
+                )
+                if reasoning and isinstance(reasoning, str) and reasoning.strip():
+                    content = reasoning
             if raw_tool_calls:
                 for tc in raw_tool_calls:
                     tc_id = getattr(tc, "id", None) or str(uuid.uuid4())
@@ -422,6 +434,7 @@ class OpenAIProvider(BaseProvider):
                     return
 
             accumulated_content: List[str] = []
+            accumulated_reasoning: List[str] = []
             tool_calls_builder: Dict[int, Dict[str, Any]] = {}
             usage = UsageMetadata()
             stream_finish_reason: Optional[str] = None
@@ -457,6 +470,15 @@ class OpenAIProvider(BaseProvider):
                     text_chunk = delta.content
                     accumulated_content.append(text_chunk)
                     yield StreamEvent(event_type=StreamEventType.TEXT_CHUNK, delta=text_chunk)
+                else:
+                    extra = getattr(delta, "model_extra", None) or {}
+                    reasoning_chunk = (
+                        getattr(delta, "reasoning_content", None)
+                        or extra.get("reasoning_content")
+                        or extra.get("thought")
+                    )
+                    if reasoning_chunk and isinstance(reasoning_chunk, str):
+                        accumulated_reasoning.append(reasoning_chunk)
 
                 if getattr(delta, "tool_calls", None):
                     for tc_chunk in delta.tool_calls:
@@ -508,6 +530,8 @@ class OpenAIProvider(BaseProvider):
                 yield StreamEvent(event_type=StreamEventType.TOOL_CALL_DETECTED, tool_call=tc_obj)
 
             final_text = "".join(accumulated_content) if accumulated_content else None
+            if not final_text and not final_tool_calls and accumulated_reasoning:
+                final_text = "".join(accumulated_reasoning)
             final_msg = Message(
                 role="assistant",
                 content=final_text,

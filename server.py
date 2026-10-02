@@ -745,6 +745,16 @@ async def _execute_agent_run(
             max_iterations=payload.max_iterations,
         ):
             if event.event_type == StreamEventType.TEXT_CHUNK and event.delta:
+                if event.metadata.get("failover"):
+                    await queue.put({
+                        "event": "provider.failover",
+                        "run_id": run_id,
+                        "failed_tier": event.metadata.get("failed_tier"),
+                        "target_tier": event.metadata.get("target_tier"),
+                        "target_model": event.metadata.get("target_model"),
+                        "reason": event.metadata.get("reason"),
+                    })
+                    continue
                 full_output += event.delta
                 await queue.put({
                     "event": "message.delta",
@@ -1329,6 +1339,8 @@ async def chat_completions_endpoint(
                     model=target_model,
                 ):
                     if event.event_type == StreamEventType.TEXT_CHUNK and event.delta:
+                        if event.metadata.get("failover"):
+                            continue
                         chunk_data = {
                             "id": chunk_id,
                             "object": "chat.completion.chunk",
@@ -1412,7 +1424,8 @@ async def chat_completions_endpoint(
         model=target_model,
     ):
         if event.event_type == StreamEventType.TEXT_CHUNK and event.delta:
-            full_content += event.delta
+            if not event.metadata.get("failover"):
+                full_content += event.delta
         elif event.event_type == StreamEventType.TURN_COMPLETE and event.message:
             usage = getattr(event.message, "usage", None)
             if usage:
@@ -1629,6 +1642,8 @@ async def ollama_chat_endpoint(request: Request):
                     model=target_model,
                 ):
                     if event.event_type == StreamEventType.TEXT_CHUNK and event.delta:
+                        if event.metadata.get("failover"):
+                            continue
                         chunk_obj = {
                             "model": model_name,
                             "created_at": created_at,
