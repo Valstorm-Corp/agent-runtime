@@ -125,6 +125,73 @@ def test_format_attached_skills_context():
     assert "skill_view" in formatted
 
 
+def test_format_persona_scope_context():
+    """Verify format_persona_scope_context outputs structured domain and knowledge boundaries."""
+    from core.context import format_persona_scope_context
+
+    # Case 1: Empty or None profile
+    assert format_persona_scope_context(None) == ""
+    assert format_persona_scope_context({}) == ""
+
+    # Case 2: Full persona scoping
+    prof = {
+        "name": "Marketing Specialist",
+        "api_name": "marketing-specialist",
+        "knowledge_vaults": ["vaul_brand_01", {"id": "vaul_campaigns_02", "name": "Q4 Campaigns"}],
+        "knowledge_files": ["file_sop_1", {"id": "file_sop_2", "name": "Copywriting_SOP.md"}],
+        "scoped_paths": ["apps/marketing-v3/**", "packages/ui/**"],
+    }
+    formatted = format_persona_scope_context(prof)
+
+    assert "# 🧭 Persona Domain & Scoped Knowledge:" in formatted
+    assert "Marketing Specialist (`marketing-specialist`)" in formatted
+    assert "Primary Knowledge Vaults:" in formatted
+    assert "`vaul_brand_01`" in formatted
+    assert "Q4 Campaigns (`vaul_campaigns_02`)" in formatted
+    assert "Pinned Knowledge Files:" in formatted
+    assert "`file_sop_1`" in formatted
+    assert "Copywriting_SOP.md (`file_sop_2`)" in formatted
+    assert "Prioritized Repository Paths:" in formatted
+    assert "`apps/marketing-v3/**`" in formatted
+    assert "`packages/ui/**`" in formatted
+    assert "Tool Scoping Directive:" in formatted
+
+
+def test_workspace_orientation_and_scoped_prompt_assembly(tmp_path):
+    """Verify WorkspaceContextManager injects git orientation and persona scope into system prompt."""
+    from core.context import WorkspaceContextManager
+
+    # Setup mock git repo & packages
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/context-aware\n")
+    (tmp_path / "apps").mkdir()
+    (tmp_path / "packages").mkdir()
+
+    ctx_mgr = WorkspaceContextManager(workdir=str(tmp_path))
+    orientation = ctx_mgr.get_workspace_orientation()
+    assert orientation["git_branch"] == "feature/context-aware"
+    assert "apps" in orientation["key_directories"]
+    assert "packages" in orientation["key_directories"]
+
+    # Assemble prompt with custom scoped profile
+    prof = {
+        "name": "DevOps Engineer",
+        "api_name": "devops",
+        "system_prompt": "You are a DevOps engineer.",
+        "knowledge_vaults": ["vaul_infra_99"],
+        "scoped_paths": ["k8s/**"],
+    }
+    prompt = ctx_mgr.build_system_prompt(profile=prof)
+
+    assert "Git Branch: feature/context-aware" in prompt
+    assert "Project Structure: apps, packages" in prompt
+    assert "Active Profile: DevOps Engineer (devops)" in prompt
+    assert "# 🧭 Persona Domain & Scoped Knowledge:" in prompt
+    assert "vaul_infra_99" in prompt
+    assert "k8s/**" in prompt
+
+
 def test_tool_whitelist_scoping():
     """Verify filtering registry by profile allowed_tools isolates tools."""
     full_registry = get_default_registry()

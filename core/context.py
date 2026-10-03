@@ -658,6 +658,53 @@ def format_attached_skills_context(skill_slugs: List[str]) -> str:
     return "\n".join(lines)
 
 
+def format_persona_scope_context(prof_data: Optional[Dict[str, Any]]) -> str:
+    """Formats knowledge vaults, knowledge files, and scoped local paths from an active profile."""
+    if not prof_data or not isinstance(prof_data, dict):
+        return ""
+
+    vaults = prof_data.get("knowledge_vaults") or []
+    files = prof_data.get("knowledge_files") or []
+    paths = prof_data.get("scoped_paths") or []
+
+    if not vaults and not files and not paths:
+        return ""
+
+    lines = ["\n# 🧭 Persona Domain & Scoped Knowledge:"]
+    persona_name = prof_data.get("name") or "Specialist"
+    persona_api = prof_data.get("api_name") or "agent"
+    lines.append(f"- Active Persona: {persona_name} (`{persona_api}`)")
+
+    if vaults:
+        lines.append("- Primary Knowledge Vaults:")
+        for v in vaults:
+            if isinstance(v, dict):
+                v_name = v.get("name") or v.get("title") or v.get("id")
+                v_id = v.get("id")
+                lines.append(f"  * {v_name} (`{v_id}`)" if v_id and v_name != v_id else f"  * {v_name}")
+            else:
+                lines.append(f"  * `{v}`")
+
+    if files:
+        lines.append("- Pinned Knowledge Files:")
+        for f in files:
+            if isinstance(f, dict):
+                f_name = f.get("name") or f.get("title") or f.get("id")
+                f_id = f.get("id")
+                lines.append(f"  * {f_name} (`{f_id}`)" if f_id and f_name != f_id else f"  * {f_name}")
+            else:
+                lines.append(f"  * `{f}`")
+
+    if paths:
+        lines.append("- Prioritized Repository Paths:")
+        for p in paths:
+            lines.append(f"  * `{p}`")
+
+    lines.append("- Tool Scoping Directive: Prioritize searching, reading, and mutating within these assigned vaults, files, and repository paths before inspecting global workspace files.")
+
+    return "\n".join(lines)
+
+
 class WorkspaceContextManager:
     """Discovers and compiles repository guidelines, rules, and profile prompts into system context."""
 
@@ -680,6 +727,34 @@ class WorkspaceContextManager:
                     except Exception:
                         pass
         return discovered
+
+    def get_workspace_orientation(self) -> Dict[str, Any]:
+        """Discovers fast, deterministic repository orientation (git branch, key directories)."""
+        orientation: Dict[str, Any] = {}
+        # 1. Fast git branch detection without subprocess overhead
+        try:
+            for directory in [self.workdir, *self.workdir.parents]:
+                git_head = directory / ".git" / "HEAD"
+                if git_head.is_file():
+                    head_content = git_head.read_text(encoding="utf-8", errors="replace").strip()
+                    if head_content.startswith("ref: refs/heads/"):
+                        orientation["git_branch"] = head_content[16:]
+                    else:
+                        orientation["git_branch"] = head_content[:8]
+                    break
+        except Exception:
+            pass
+
+        # 2. Monorepo / project structure detection
+        detected_roots: List[str] = []
+        for cand in ["apps", "packages", "sdks", "services", "cli", "src"]:
+            p = self.workdir / cand
+            if p.is_dir():
+                detected_roots.append(cand)
+        if detected_roots:
+            orientation["key_directories"] = detected_roots
+
+        return orientation
 
     def get_valstorm_workspace_config(self) -> Dict[str, str]:
         """Reads valstorm.json if present."""
@@ -726,6 +801,12 @@ class WorkspaceContextManager:
             f"- Working Directory: {self.workdir}",
             f"- Current Date & Time: {now_str}",
         ]
+
+        ws_orient = self.get_workspace_orientation()
+        if ws_orient.get("git_branch"):
+            parts.append(f"- Git Branch: {ws_orient['git_branch']}")
+        if ws_orient.get("key_directories"):
+            parts.append(f"- Project Structure: {', '.join(ws_orient['key_directories'])}")
 
         if prof_data:
             parts.append(f"- Active Profile: {prof_data.get('name')} ({prof_data.get('api_name')})")
@@ -784,6 +865,11 @@ class WorkspaceContextManager:
             skills_ctx = format_attached_skills_context(attached_slugs)
             if skills_ctx:
                 parts.append(skills_ctx)
+
+            # Inject Persona Domain & Scoped Knowledge (Vaults, Files, Scoped Paths)
+            scope_ctx = format_persona_scope_context(prof_data)
+            if scope_ctx:
+                parts.append(scope_ctx)
 
         # Inject Core Autonomous Agent Operating Protocols & Guardrails
         parts.append(

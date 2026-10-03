@@ -131,7 +131,7 @@ class GeminiProvider(BaseProvider):
         return "vertex" if self.is_enterprise_mode() else "aistudio"
 
     # ------------------------------------------------------------------ thinking
-    def _thinking_config(self) -> Optional[Any]:
+    def _thinking_config(self, model_name: Optional[str] = None) -> Optional[Any]:
         """Explicit thinking level (VALSTORM_THINKING_LEVEL, default "medium"; "off" to omit).
 
         Backends apply different defaults when none is sent, which is one reason agent effort
@@ -142,6 +142,8 @@ class GeminiProvider(BaseProvider):
         from google.genai import types
 
         if self._thinking_disabled:
+            return None
+        if model_name and "lite" in str(model_name).lower():
             return None
         level = (os.getenv("VALSTORM_THINKING_LEVEL") or "medium").strip().upper()
         if level in ("", "OFF", "NONE", "DEFAULT", "AUTO"):
@@ -171,7 +173,7 @@ class GeminiProvider(BaseProvider):
         for k in ("temperature", "top_p", "top_k", "max_output_tokens"):
             if k in kwargs:
                 config_args[k] = kwargs[k]
-        thinking = self._thinking_config()
+        thinking = self._thinking_config(model_name=kwargs.get("model"))
         if thinking is not None:
             config_args["thinking_config"] = thinking
         if self.backend == "valstorm":
@@ -612,6 +614,9 @@ class GeminiProvider(BaseProvider):
     ) -> AsyncIterator[Union[StreamEvent, Tuple[Message, UsageMetadata]]]:
         """Stream response chunks from Gemini, yielding StreamEvents and final (Message, UsageMetadata) with retry."""
         model_name = model or self.default_model or "gemini-flash-latest"
+        use_vertex = self.backend == "vertex" or (self.backend != "aistudio" and self.is_enterprise_mode())
+        if use_vertex and model_name.lower() == "gemini-flash-lite-latest":
+            model_name = "gemini-2.5-flash-lite"
 
         # Intelligent routing for Valstorm Gateway backend (GEAP/Partner models)
         if self.backend == "valstorm" and not is_gemini_model(model_name):
@@ -639,7 +644,7 @@ class GeminiProvider(BaseProvider):
             while True:
                 attempts += 1
                 client = self._get_client()
-                config = self._build_config(system_instruction, gemini_tools, kwargs)
+                config = self._build_config(system_instruction, gemini_tools, {**kwargs, "model": model_name})
                 try:
                     return await client.aio.models.generate_content_stream(
                         model=model_name,
@@ -763,6 +768,9 @@ class GeminiProvider(BaseProvider):
     ) -> Tuple[Message, UsageMetadata]:
         """Generate response non-streaming from Gemini with exponential backoff retry."""
         model_name = model or self.default_model or "gemini-flash-latest"
+        use_vertex = self.backend == "vertex" or (self.backend != "aistudio" and self.is_enterprise_mode())
+        if use_vertex and model_name.lower() == "gemini-flash-lite-latest":
+            model_name = "gemini-2.5-flash-lite"
 
         # Intelligent routing for Valstorm Gateway backend (GEAP/Partner models)
         if self.backend == "valstorm" and not is_gemini_model(model_name):
@@ -785,7 +793,7 @@ class GeminiProvider(BaseProvider):
             while True:
                 attempts += 1
                 client = self._get_client()
-                config = self._build_config(system_instruction, gemini_tools, kwargs)
+                config = self._build_config(system_instruction, gemini_tools, {**kwargs, "model": model_name})
                 try:
                     response = await client.aio.models.generate_content(
                         model=model_name,
